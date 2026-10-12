@@ -10,20 +10,23 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
   await ctx.session.hook("context", async (event: any) => {
     try {
       const agentName = resolveAgentName(event);
-      const lastUser = findLastUserMessage(event.messages);
+      const lastUserText = findLastUserMessageText(event.messages);
+      // Normalize host messages (string or content-parts formats) into the
+      // plugin's internal { role, content } shape for recall composition.
+      const messages = normalizeMessages(event.messages ?? []);
 
       // Always inject core memory (small, stable facts).
       const core = await memory.getCoreMemories(agentName);
 
       // On-demand recall for the current user message.
       let recalled: RecallResult[] = [];
-      if (lastUser) {
-        const key = `${agentName}:${lastUser.content.trim()}`;
+      if (lastUserText) {
+        const key = `${agentName}:${lastUserText}`;
         const cached = recallCache.get(key);
         if (cached) {
           recalled = cached;
         } else {
-          recalled = await memory.recallForMessage(lastUser.content, event.messages ?? [], agentName);
+          recalled = await memory.recallForMessage(lastUserText, messages, agentName);
           recallCache.set(key, recalled);
           // Cap cache size.
           if (recallCache.size > 100) {
@@ -44,8 +47,10 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
         maxTokens: event.budget?.memory ?? 768,
       });
 
+      // OpenCode's system parts are structured values ({ type: "text", text }),
+      // not raw strings — pushing a bare string fails host-side validation.
       if (contextText && Array.isArray(event.system)) {
-        event.system.push(contextText);
+        event.system.push({ type: "text", text: contextText });
       }
     } catch (error) {
       // Fail open so OpenCode keeps working even if Hindsight is down.
@@ -79,6 +84,9 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
 }
 
 function resolveAgentName(event: any): string | undefined {
+  // OpenCode passes the agent as a branded string ID on session context
+  // events; older/other events may carry an object or agentID field.
+  if (typeof event?.agent === "string") return event.agent;
   return (
     event.agent?.id ??
     event.session?.agent?.id ??
@@ -88,11 +96,27 @@ function resolveAgentName(event: any): string | undefined {
   );
 }
 
-function findLastUserMessage(messages: any[] = []): any | undefined {
+/**
+ * Find the latest user message and extract its text.
+ *
+ * Message content is either a plain string (older hosts) or an array of
+ * content parts ({ type: "text", text }) in the current OpenCode/AI SDK
+ * format, so normalize both.
+ */
+function findLastUserMessageText(messages: any[] = []): string | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") return messages[i];
+    const message = messages[i];
+    if (message?.role !== "user") continue;
+    const text = messageText(message);
+    if (text.trim()) return text;
   }
   return undefined;
+}
+
+function messageText(message: any): string {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  return extractTextParts(content ?? message?.parts);
 }
 
 async function getSessionMessages(

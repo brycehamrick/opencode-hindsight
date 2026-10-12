@@ -64,10 +64,48 @@ describe("registerHooks", () => {
     expect(memory.getCoreMemories).toHaveBeenCalledWith("reviewer");
     expect(memory.recallForMessage).toHaveBeenCalledWith("hello", [{ role: "user", content: "hello" }], "reviewer");
     expect(event.system.length).toBe(1);
-    expect(event.system[0]).toContain("core fact");
-    expect(event.system[0]).toContain("recalled fact");
+    expect(event.system[0].type).toBe("text");
+    expect(event.system[0].text).toContain("core fact");
+    expect(event.system[0].text).toContain("recalled fact");
 
     cleanup();
+  });
+
+  it("extracts text from AI SDK content-part arrays (OpenCode 2.0.27 format)", async () => {
+    const memory = createMockMemory();
+    await registerHooks(createCtx(), memory);
+
+    const event = {
+      messages: [
+        { role: "user", content: [{ type: "text", text: "what did we decide" }] },
+      ],
+      system: [],
+      agent: "build",
+    };
+    await sessionHooks[0](event);
+
+    expect(memory.getCoreMemories).toHaveBeenCalledWith("build");
+    expect(memory.recallForMessage).toHaveBeenCalledWith(
+      "what did we decide",
+      [{ role: "user", content: "what did we decide" }],
+      "build"
+    );
+    expect(event.system.length).toBe(1);
+    expect(event.system[0].type).toBe("text");
+  });
+
+  it("skips recall when the user message has no extractable text", async () => {
+    const memory = createMockMemory();
+    await registerHooks(createCtx(), memory);
+
+    const event = {
+      messages: [{ role: "user", content: [{ type: "media", mediaType: "image/png", data: "..." }] }],
+      system: [],
+    };
+    await sessionHooks[0](event);
+
+    expect(memory.recallForMessage).not.toHaveBeenCalled();
+    expect(event.system.length).toBe(1);
   });
 
   it("deduplicates recalled results that are already in core memory", async () => {
@@ -79,9 +117,9 @@ describe("registerHooks", () => {
     const event = { messages: [{ role: "user", content: "hello" }], system: [] };
     await sessionHooks[0](event);
 
-    expect(event.system[0]).toContain("shared fact");
-    expect(event.system[0]).toContain("unique fact");
-    expect(event.system[0].match(/shared fact/g)?.length).toBe(1);
+    expect(event.system[0].text).toContain("shared fact");
+    expect(event.system[0].text).toContain("unique fact");
+    expect(event.system[0].text.match(/shared fact/g)?.length).toBe(1);
   });
 
   it("caches recall for the same user message", async () => {

@@ -38,7 +38,6 @@ export interface PluginContext {
   readonly logger?: unknown;
   readonly [key: string]: unknown;
 }
-
 /** OpenCode V2 promise-plugin definition. */
 export interface HindsightPluginDefinition {
   readonly id: string;
@@ -54,13 +53,11 @@ export default {
 
     const directory = resolveWorkspaceDirectory(ctx);
 
-    // Resolve the default agent name. OpenCode V2 exposes ctx.agent; fall back
-    // to the configured agentName (or "opencode") when it is unavailable.
-    const agent = ctx.agent as
-      | { default?: { id?: string }; get?: (id: string) => { id?: string } | undefined }
-      | undefined;
-    const defaultAgentName =
-      agent?.default?.id ?? agent?.get?.("default")?.id ?? config.agentName ?? "opencode";
+    // Resolve the default agent name from config. Note: ctx.agent is a live
+    // API domain in current OpenCode builds (its get() performs an RPC call
+    // with a structured payload), so it must not be probed speculatively —
+    // per-event agent resolution happens in the session hooks instead.
+    const defaultAgentName = config.agentName ?? "opencode";
 
     const memory = createMemoryManager({
       config,
