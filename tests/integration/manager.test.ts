@@ -71,6 +71,26 @@ describe("MemoryManager", () => {
     vi.clearAllMocks();
   });
 
+  it("derives dynamic bank IDs per workspace directory as sessions report in", () => {
+    const manager = createManager({
+      dynamicBankId: true,
+      dynamicBankGranularity: ["agent", "gitProject"],
+    });
+
+    // Initial directory (setup-time guess) drives the first bank.
+    expect(manager.getDiagnostics("build").bankId).toBe("build::test");
+
+    // A session reporting a different directory re-derives the bank.
+    manager.setWorkspaceDirectory("/work/other-repo");
+    expect(manager.getDiagnostics("build").bankId).toBe("build::other-repo");
+    expect(manager.getDiagnostics().directory).toBe("/work/other-repo");
+
+    // Same directory again is a no-op; empty strings are ignored.
+    manager.setWorkspaceDirectory("/work/other-repo");
+    manager.setWorkspaceDirectory("");
+    expect(manager.getDiagnostics().directory).toBe("/work/other-repo");
+  });
+
   it("initializes and creates bank mission", async () => {
     const manager = createManager({ bankMission: "test mission" });
 

@@ -6,6 +6,7 @@ function createMockMemory(): MemoryManager {
   return {
     initialize: vi.fn().mockResolvedValue(undefined),
     shutdown: vi.fn().mockResolvedValue(undefined),
+    setWorkspaceDirectory: vi.fn(),
     getCoreMemories: vi.fn().mockResolvedValue([{ text: "core fact" }]),
     recallForMessage: vi.fn().mockResolvedValue([{ text: "recalled fact" }]),
     recallByQuery: vi.fn().mockResolvedValue([{ text: "query result" }]),
@@ -32,6 +33,10 @@ describe("registerHooks", () => {
           sessionHooks.push(cb);
           return Promise.resolve();
         }),
+        get: vi.fn(async ({ sessionID }: { sessionID: string }) => ({
+          id: sessionID,
+          location: { directory: "/work/proj-a" },
+        })),
       },
       event: {
         subscribe: vi.fn((opts?: { signal?: AbortSignal }) => {
@@ -58,9 +63,10 @@ describe("registerHooks", () => {
 
     expect(sessionHooks.length).toBe(1);
 
-    const event = { messages: [{ role: "user", content: "hello" }], system: [], agent: { id: "reviewer" } };
+    const event = { sessionID: "ses-1", messages: [{ role: "user", content: "hello" }], system: [], agent: { id: "reviewer" } };
     await sessionHooks[0](event);
 
+    expect(memory.setWorkspaceDirectory).toHaveBeenCalledWith("/work/proj-a");
     expect(memory.getCoreMemories).toHaveBeenCalledWith("reviewer");
     expect(memory.recallForMessage).toHaveBeenCalledWith("hello", [{ role: "user", content: "hello" }], "reviewer");
     expect(event.system.length).toBe(1);

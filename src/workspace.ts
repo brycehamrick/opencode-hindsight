@@ -144,7 +144,12 @@ function pickString(...values: unknown[]): string | null {
 export function resolveWorkspaceDirectory(ctx: any): string {
   const candidates: string[] = [];
 
-  // OpenCode V2 documented fields.
+  // OpenCode 2.0.27+ exposes the host location (directory plus project info)
+  // directly on the plugin context.
+  const locationPath = pickString(ctx?.location?.directory, ctx?.location?.project?.directory, ctx?.location?.project?.canonical);
+  if (locationPath) candidates.push(locationPath);
+
+  // Documented / legacy fields.
   const worktree = pickString(ctx?.worktree);
   if (worktree) candidates.push(worktree);
 
@@ -193,5 +198,5 @@ export function resolveWorkspaceDirectory(ctx: any): string {
     if (found) return found;
   }
 
-  return worktree || directory || projectPath || workspacePath || process.cwd();
+  return locationPath || worktree || directory || projectPath || workspacePath || process.cwd();
 }

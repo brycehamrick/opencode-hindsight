@@ -5,10 +5,37 @@ import { formatMemoryContext } from "../memory/content.js";
 export async function registerHooks(ctx: any, memory: MemoryManager): Promise<() => void> {
   // Cache per-message recall results keyed by the latest user message content.
   const recallCache = new Map<string, RecallResult[]>();
+  // Cache sessionID -> workspace directory so each session's bank derivation
+  // uses the directory the session actually runs in.
+  const sessionDirectories = new Map<string, string>();
+
+  async function ensureSessionWorkspace(sessionID: unknown): Promise<void> {
+    if (typeof sessionID !== "string" || !sessionID) return;
+    if (sessionDirectories.has(sessionID)) {
+      memory.setWorkspaceDirectory(sessionDirectories.get(sessionID)!);
+      return;
+    }
+    try {
+      const session = await ctx.session?.get?.({ sessionID });
+      const directory = session?.location?.directory;
+      if (typeof directory === "string" && directory.trim()) {
+        sessionDirectories.set(sessionID, directory);
+        // Cap cache size.
+        if (sessionDirectories.size > 500) {
+          const first = sessionDirectories.keys().next().value;
+          if (first) sessionDirectories.delete(first);
+        }
+        memory.setWorkspaceDirectory(directory);
+      }
+    } catch {
+      // Fail open — keep the existing workspace directory.
+    }
+  }
 
   // Per-message recall + core memory.
   await ctx.session.hook("context", async (event: any) => {
     try {
+      await ensureSessionWorkspace(event.sessionID);
       const agentName = resolveAgentName(event);
       const lastUserText = findLastUserMessageText(event.messages);
       // Normalize host messages (string or content-parts formats) into the
@@ -67,6 +94,7 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
           const sessionId = event.properties?.sessionID ?? event.sessionID;
           if (!sessionId) continue;
 
+          await ensureSessionWorkspace(sessionId);
           const messages = event.messages ?? (await getSessionMessages(ctx, sessionId));
           if (messages.length) {
             const agentName = resolveAgentName(event);

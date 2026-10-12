@@ -4,6 +4,19 @@ import { formatMemories, formatCurrentTime } from "../memory/content.js";
 const NAMESPACE = "hindsight";
 
 export async function registerTools(ctx: any, memory: MemoryManager): Promise<void> {
+  // Tools execute within a session; make bank derivation follow that
+  // session's directory before touching memory.
+  async function ensureWorkspace(sessionID: unknown): Promise<void> {
+    if (typeof sessionID !== "string" || !sessionID) return;
+    try {
+      const session = await ctx.session?.get?.({ sessionID });
+      const directory = session?.location?.directory;
+      if (typeof directory === "string") memory.setWorkspaceDirectory(directory);
+    } catch {
+      // Fail open — keep the current workspace directory.
+    }
+  }
+
   await ctx.tool.transform((draft: any) => {
     draft.add({
       name: "hindsight_retain",
@@ -21,7 +34,8 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         additionalProperties: false,
       },
       options: { namespace: NAMESPACE, codemode: true },
-      execute: async (input: { content: string; context?: string; tags?: string[]; agent?: string }) => {
+      execute: async (input: { content: string; context?: string; tags?: string[]; agent?: string }, toolCtx?: { sessionID?: string }) => {
+        await ensureWorkspace(toolCtx?.sessionID);
         await memory.retainFact(
           input.content,
           input.context,
@@ -48,7 +62,8 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         additionalProperties: false,
       },
       options: { namespace: NAMESPACE, codemode: true },
-      execute: async (input: { query: string; maxTokens?: number; agent?: string }) => {
+      execute: async (input: { query: string; maxTokens?: number; agent?: string }, toolCtx?: { sessionID?: string }) => {
+        await ensureWorkspace(toolCtx?.sessionID);
         const results = await memory.recallByQuery(input.query, input.maxTokens, input.agent);
         if (!results.length) return { content: "No relevant memories found." };
         const formatted = formatMemories(results);
@@ -72,7 +87,8 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         additionalProperties: false,
       },
       options: { namespace: NAMESPACE, codemode: true },
-      execute: async (input: { query: string; context?: string; agent?: string }) => {
+      execute: async (input: { query: string; context?: string; agent?: string }, toolCtx?: { sessionID?: string }) => {
+        await ensureWorkspace(toolCtx?.sessionID);
         const answer = await memory.reflect(input.query, input.context, input.agent);
         return { content: answer };
       },
@@ -91,7 +107,8 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         additionalProperties: false,
       },
       options: { namespace: NAMESPACE, codemode: true },
-      execute: async (input: { documentId?: string; query?: string; agent?: string }) => {
+      execute: async (input: { documentId?: string; query?: string; agent?: string }, toolCtx?: { sessionID?: string }) => {
+        await ensureWorkspace(toolCtx?.sessionID);
         const ok = await memory.forget(input.documentId, input.query, input.agent);
         return { content: ok ? "Memory removed." : "Could not remove memory (unsupported or not found)." };
       },
@@ -108,7 +125,8 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         additionalProperties: false,
       },
       options: { namespace: NAMESPACE, codemode: true },
-      execute: async (input: { agent?: string }) => {
+      execute: async (input: { agent?: string }, toolCtx?: { sessionID?: string }) => {
+        await ensureWorkspace(toolCtx?.sessionID);
         const diag = memory.getDiagnostics(input.agent);
         return {
           content: `Hindsight diagnostics:\n- Workspace directory: ${diag.directory}\n- Memory bank: ${diag.bankId}\n- Agent: ${diag.agent}`,

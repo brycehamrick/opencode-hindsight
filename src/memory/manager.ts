@@ -11,6 +11,7 @@ import { formatMemoryContext, formatCurrentTime } from "./content.js";
 export interface MemoryManager {
   initialize(agentName?: string): Promise<void>;
   shutdown(): Promise<void>;
+  setWorkspaceDirectory(directory: string): void;
   getCoreMemories(agentName?: string): Promise<RecallResult[]>;
   recallForMessage(message: string, recentMessages: Message[], agentName?: string): Promise<RecallResult[]>;
   recallByQuery(query: string, maxTokens?: number, agentName?: string): Promise<RecallResult[]>;
@@ -40,8 +41,13 @@ interface AgentEngines {
 }
 
 export function createMemoryManager(deps: MemoryManagerDependencies): MemoryManager {
-  const { config, state, directory, logger, storage } = deps;
+  const { config, state, logger, storage } = deps;
   const defaultAgentName = deps.defaultAgentName ?? config.agentName ?? "opencode";
+
+  // The workspace directory is resolved per session (each OpenCode session
+  // knows its own location.directory); the value passed at construction is
+  // only the initial/default guess until the first session reports in.
+  let currentDirectory = deps.directory;
 
   const client = createHindsightClientWrapper({
     baseUrl: config.hindsightApiUrl,
@@ -64,7 +70,7 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
         dynamicBankGranularity: config.dynamicBankGranularity,
         agentName,
       },
-      directory
+      currentDirectory
     );
 
     const engines: AgentEngines = {
@@ -83,6 +89,21 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     if (storage) {
       await saveState(storage, state);
     }
+  }
+
+  /**
+   * Update the workspace directory used for bank derivation. Called when a
+   * session reports its own location (OpenCode's background service hosts
+   * sessions from many directories in one process, so the directory cannot
+   * be resolved once at setup time).
+   */
+  function setWorkspaceDirectory(directory: string): void {
+    if (typeof directory !== "string" || !directory.trim()) return;
+    if (directory === currentDirectory) return;
+    currentDirectory = directory;
+    // Bank IDs depend on the directory, so stale engines must be rebuilt.
+    enginesByAgent.clear();
+    logger.info("Hindsight workspace directory updated", { directory });
   }
 
   async function initialize(agentName?: string): Promise<void> {
@@ -266,12 +287,13 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
   function getDiagnostics(agentName?: string): { directory: string; bankId: string; agent: string } {
     const name = agentName ?? defaultAgentName;
     const engines = getEngines(name);
-    return { directory, bankId: engines.bankId, agent: name };
+    return { directory: currentDirectory, bankId: engines.bankId, agent: name };
   }
 
   return {
     initialize,
     shutdown,
+    setWorkspaceDirectory,
     getCoreMemories,
     recallForMessage,
     recallByQuery,
