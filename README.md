@@ -1,6 +1,6 @@
-# @brycehamrick/opencode-v2-hindsight
+# @brycehamrick/opencode-hindsight
 
-A best-in-class, token-efficient long-term memory plugin for [OpenCode V2](https://opencode.ai).
+A best-in-class, token-efficient long-term memory plugin for [OpenCode](https://opencode.ai).
 
 ## Features
 
@@ -19,14 +19,16 @@ A best-in-class, token-efficient long-term memory plugin for [OpenCode V2](https
 Install the plugin from npm:
 
 ```bash
-npm install -g @brycehamrick/opencode-v2-hindsight
+npm install -g @brycehamrick/opencode-hindsight
 ```
 
-OpenCode V2 resolves the `"package"` field in `opencode.jsonc` against npm by default, so you can reference the package by name.
+> **Renamed:** this package was previously published as `@brycehamrick/opencode-v2-hindsight`. If your config references the old name, update it to `@brycehamrick/opencode-hindsight`.
 
-### 1. Add to your OpenCode V2 config
+OpenCode resolves the `"package"` field in `opencode.jsonc` against npm by default, so you can reference the package by name.
 
-OpenCode V2 reads config from the global config location (commonly `~/.config/opencode/opencode.jsonc`) and from project configs such as `.opencode/opencode.jsonc` or `opencode.jsonc` in the project directory. Project configs override global ones. The exact global path can vary by OS/OpenCode version — check `opencode --help` or the OpenCode docs if the file does not exist.
+### 1. Add to your OpenCode config
+
+OpenCode reads config from the global config location (commonly `~/.config/opencode/opencode.jsonc`) and from project configs such as `.opencode/opencode.jsonc` or `opencode.jsonc` in the project directory. Project configs override global ones. The exact global path can vary by OS/OpenCode version — check `opencode --help` or the OpenCode docs if the file does not exist.
 
 #### Option A: Global config
 
@@ -37,7 +39,7 @@ Edit your global OpenCode config (commonly `~/.config/opencode/opencode.jsonc`):
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "dynamicBankId": true,
         "dynamicBankGranularity": ["agent", "gitProject"]
@@ -56,7 +58,7 @@ Create `.opencode/opencode.jsonc` in your project root:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "bankId": "my-project",
         "dynamicBankId": true,
@@ -81,7 +83,7 @@ In `opencode.jsonc`:
 {
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "hindsightApiUrl": "http://localhost:8888"
       }
@@ -106,7 +108,7 @@ In `opencode.jsonc`:
 {
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "hindsightApiUrl": "https://api.hindsight.vectorize.io",
         "hindsightApiToken": "hz_..."
@@ -142,7 +144,7 @@ Example global config:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "dynamicBankId": true,
         "dynamicBankGranularity": ["agent", "gitProject"],
@@ -160,7 +162,7 @@ Example per-project override:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "bankId": "legacy-monolith",
         "dynamicBankId": false,
@@ -177,13 +179,13 @@ The project config replaces the global plugin options for that workspace. If you
 
 ## Per-agent scoping
 
-OpenCode V2 supports multiple agents. To give each agent its own memory bank, enable dynamic bank IDs and include `agent` in the granularity:
+OpenCode supports multiple agents. To give each agent its own memory bank, enable dynamic bank IDs and include `agent` in the granularity:
 
 ```jsonc
 {
   "plugins": [
     {
-      "package": "@brycehamrick/opencode-v2-hindsight",
+      "package": "@brycehamrick/opencode-hindsight",
       "options": {
         "dynamicBankId": true,
         "dynamicBankGranularity": ["agent", "project"]
@@ -260,14 +262,14 @@ Configuration priority (later wins):
 To build and test from source:
 
 ```bash
-git clone https://github.com/brycehamrick/opencode-v2-hindsight.git
-cd opencode-v2-hindsight
+git clone https://github.com/brycehamrick/opencode-hindsight.git
+cd opencode-hindsight
 npm install
 npm test
 npm run build
 ```
 
-To use a local build in OpenCode, point the `"package"` field to the absolute path of `dist/index.js`.
+To use a local build in OpenCode, run `npm run build`, then point the `"package"` field at the `dist` directory (local plugin targets must be directories): `"/absolute/path/to/opencode-hindsight/dist"`.
 
 ## Example configs
 
@@ -275,7 +277,7 @@ See `examples/opencode.jsonc` and `examples/global-opencode.jsonc`.
 
 ## Status
 
-This plugin targets OpenCode V2 and is **not** compatible with OpenCode V1.
+This plugin requires OpenCode v2.0 or newer and is **not** compatible with OpenCode V1. Built for and tested against opencode v2.0.27.
 
 ## License
 

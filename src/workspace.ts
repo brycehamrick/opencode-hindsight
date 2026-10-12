@@ -14,6 +14,9 @@ const PROJECT_MARKERS = [
 // directory (especially for npm-loaded plugins). As a last resort, search for
 // an OpenCode config file that references this plugin package.
 const PLUGIN_PACKAGE_NAMES = [
+  "@brycehamrick/opencode-hindsight",
+  "opencode-hindsight",
+  // Legacy name (pre-rename) — configs may still reference it.
   "@brycehamrick/opencode-v2-hindsight",
   "opencode-v2-hindsight",
 ];

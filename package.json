@@ -1,7 +1,7 @@
 {
-  "name": "@brycehamrick/opencode-v2-hindsight",
-  "version": "0.1.3",
-  "description": "Token-efficient long-term memory plugin for OpenCode V2",
+  "name": "@brycehamrick/opencode-hindsight",
+  "version": "0.2.0",
+  "description": "Token-efficient long-term memory plugin for OpenCode",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -28,11 +28,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/brycehamrick/opencode-v2-hindsight.git"
+    "url": "git+https://github.com/brycehamrick/opencode-hindsight.git"
   },
   "keywords": [
     "opencode",
-    "opencode-v2",
     "hindsight",
     "memory",
     "long-term-memory",
@@ -41,12 +40,11 @@
   ],
   "author": "Bryce Hamrick",
   "license": "MIT",
-  "dependencies": {
-    "@opencode-ai/plugin": "beta",
-    "@vectorize-io/hindsight-client": "^0.5.2"
-  },
+  "dependencies": {},
   "devDependencies": {
+    "@opencode-ai/plugin": "beta",
     "@types/node": "^22.0.0",
+    "@vectorize-io/hindsight-client": "^0.5.2",
     "tsup": "^8.5.1",
     "typescript": "^5.7.0",
     "vitest": "^4.0.18"
