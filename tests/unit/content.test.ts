@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import {
   stripMemoryTags,
+  stripInjectedMemory,
+  boundQueryTokens,
   stripSecrets,
   stripBase64,
   sanitizeForRetention,
@@ -24,6 +26,85 @@ describe("content processing", () => {
     it("removes relevant memory blocks", () => {
       const content = `Start <relevant_memories>foo</relevant_memories> end`;
       expect(stripMemoryTags(content)).toBe("Start end");
+    });
+  });
+
+  describe("stripInjectedMemory", () => {
+    it("removes system-reminder wrapper blocks", () => {
+      const content =
+        "<system-reminder>harness instructions nobody asked for</system-reminder>\n\nFix the flaky test";
+      expect(stripInjectedMemory(content)).toBe("Fix the flaky test");
+    });
+
+    it("removes system-reminder blocks carrying attributes", () => {
+      const content = 'a <system-reminder kind="tool">noise</system-reminder> b';
+      expect(stripInjectedMemory(content)).toBe("a b");
+    });
+
+    it("removes context instruction-entry blocks", () => {
+      const content =
+        'Notes: <context key="deploy-target">production</context> ship it';
+      expect(stripInjectedMemory(content)).toBe("Notes: ship it");
+    });
+
+    it("still removes our own memory blocks (superset of stripMemoryTags)", () => {
+      const content = `Hello <hindsight_memories>\n- old fact\n</hindsight_memories> world`;
+      expect(stripInjectedMemory(content)).toBe("Hello world");
+    });
+
+    it("strips host wrappers and memory tags together", () => {
+      const content =
+        "<system-reminder>wrapper</system-reminder>\n" +
+        "<hindsight_memories>stale memory</hindsight_memories>\n" +
+        "What did we decide about retries?";
+      expect(stripInjectedMemory(content)).toContain("What did we decide about retries?");
+      expect(stripInjectedMemory(content)).not.toContain("system-reminder");
+      expect(stripInjectedMemory(content)).not.toContain("stale memory");
+    });
+
+    it("leaves unclosed tags alone rather than eating the message", () => {
+      const content = "bug: <system-reminder appeared in output as text";
+      expect(stripInjectedMemory(content)).toContain("<system-reminder");
+    });
+  });
+
+  describe("boundQueryTokens", () => {
+    it("returns text unchanged when within the token budget", () => {
+      expect(boundQueryTokens("hello world", 500)).toBe("hello world");
+    });
+
+    it("cuts ASCII text at ~2 chars per token", () => {
+      const text = "a".repeat(2000);
+      expect(boundQueryTokens(text, 500).length).toBe(1000);
+    });
+
+    it("charges 2-byte characters (CJK) by UTF-8 length", () => {
+      const text = "漢".repeat(800); // 3 bytes each in UTF-8
+      expect(boundQueryTokens(text, 500).length).toBe(166); // ceil(500/3)
+    });
+
+    it("charges 2-byte characters (Latin-1) by UTF-8 length", () => {
+      const text = "é".repeat(800); // 2 bytes each
+      expect(boundQueryTokens(text, 500).length).toBe(250); // 500/2
+    });
+
+    it("charges astral characters (emoji) 4 bytes and keeps pairs whole", () => {
+      const text = "😀".repeat(500); // 4 bytes, 2 UTF-16 units each
+      const bounded = boundQueryTokens(text, 500);
+      expect(bounded.length).toBe(250); // 125 emoji = 250 JS units
+      // The cut must not split a surrogate pair: every remaining code point
+      // is a whole emoji.
+      expect([...bounded].every((cp) => cp === "😀")).toBe(true);
+      expect([...bounded].length).toBe(125);
+    });
+
+    it("returns empty string for a non-positive budget", () => {
+      expect(boundQueryTokens("anything", 0)).toBe("");
+      expect(boundQueryTokens("anything", -5)).toBe("");
+    });
+
+    it("returns empty text as-is (never negative-length slices)", () => {
+      expect(boundQueryTokens("", 500)).toBe("");
     });
   });
 

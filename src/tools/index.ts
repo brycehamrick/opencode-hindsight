@@ -1,5 +1,6 @@
 import type { MemoryManager } from "../memory/manager.js";
 import { formatMemories, formatCurrentTime } from "../memory/content.js";
+import { diagFilePath } from "../diag.js";
 
 const NAMESPACE = "hindsight";
 
@@ -129,7 +130,12 @@ export async function registerTools(ctx: any, memory: MemoryManager): Promise<vo
         await ensureWorkspace(toolCtx?.sessionID);
         const diag = memory.getDiagnostics(input.agent);
         return {
-          content: `Hindsight diagnostics:\n- Workspace directory: ${diag.directory}\n- Memory bank: ${diag.bankId}\n- Agent: ${diag.agent}`,
+          content:
+            `Hindsight diagnostics:\n` +
+            `- Workspace directory: ${diag.directory}\n` +
+            `- Memory bank: ${diag.bankId}\n` +
+            `- Agent: ${diag.agent}\n` +
+            `- Diagnostics log: ${diagFilePath()}`,
         };
       },
     });

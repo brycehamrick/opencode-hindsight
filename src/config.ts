@@ -15,6 +15,9 @@ export interface HindsightPluginOptions extends Record<string, unknown> {
   bankMission?: string;
   retainMission?: string | null;
   autoRecall?: boolean;
+  /** Auto-injection mode: "reflect" (once per session), "recall" (once per
+   * session), "perMessage" (legacy per-turn recall), or "none" (tools only). */
+  autoInject?: "reflect" | "recall" | "perMessage" | "none";
   autoRetain?: boolean;
   retainMode?: "facts" | "transcript" | "none";
   coreMemoryMaxTokens?: number;
@@ -24,10 +27,17 @@ export interface HindsightPluginOptions extends Record<string, unknown> {
   recallBudget?: "low" | "mid" | "high";
   recallContextTurns?: number;
   recallMaxQueryChars?: number;
+  maxRecallQueryTokens?: number;
   recallPromptPreamble?: string;
   recallTypes?: string[];
   recallTags?: string[];
   recallTagsMatch?: "any" | "all" | "any_strict" | "all_strict";
+  reflectTimeoutMs?: number;
+  injectTimeoutMs?: number;
+  injectFailureAttempts?: number;
+  injectEmptyAttempts?: number;
+  minReflectPromptChars?: number;
+  coreRefreshPolicy?: "session" | "onInvalidate";
   retainContext?: string;
   retainEveryNTurns?: number;
   retainOverlapTurns?: number;
@@ -50,6 +60,7 @@ export interface HindsightConfig {
   bankMission: string;
   retainMission: string | null;
   autoRecall: boolean;
+  autoInject: "reflect" | "recall" | "perMessage" | "none";
   autoRetain: boolean;
   retainMode: "facts" | "transcript" | "none";
   coreMemoryMaxTokens: number;
@@ -59,10 +70,17 @@ export interface HindsightConfig {
   recallBudget: "low" | "mid" | "high";
   recallContextTurns: number;
   recallMaxQueryChars: number;
+  maxRecallQueryTokens: number;
   recallPromptPreamble: string;
   recallTypes: string[];
   recallTags: string[];
   recallTagsMatch: "any" | "all" | "any_strict" | "all_strict";
+  reflectTimeoutMs: number;
+  injectTimeoutMs: number;
+  injectFailureAttempts: number;
+  injectEmptyAttempts: number;
+  minReflectPromptChars: number;
+  coreRefreshPolicy: "session" | "onInvalidate";
   retainEveryNTurns: number;
   retainOverlapTurns: number;
   retainContext: string;
@@ -74,7 +92,7 @@ export interface HindsightConfig {
   debug: boolean;
 }
 
-const DEFAULTS: HindsightConfig = {
+const DEFAULTS: Omit<HindsightConfig, "autoInject"> = {
   agentName: "opencode",
   hindsightApiUrl: DEFAULT_HINDSIGHT_API_URL,
   hindsightApiToken: null,
@@ -85,6 +103,8 @@ const DEFAULTS: HindsightConfig = {
   bankMission: "",
   retainMission: null,
   autoRecall: true,
+  // Deliberately absent from DEFAULTS: the effective default is derived from
+  // autoRecall (below) so an explicit `autoRecall: false` maps to "none".
   autoRetain: true,
   retainMode: "facts",
   coreMemoryMaxTokens: 256,
@@ -94,12 +114,19 @@ const DEFAULTS: HindsightConfig = {
   recallBudget: "mid",
   recallContextTurns: 2,
   recallMaxQueryChars: 800,
+  maxRecallQueryTokens: 500,
   recallPromptPreamble:
     "Relevant memories from past conversations (prioritize recent when conflicting). " +
     "Only use memories that are directly useful; ignore the rest.",
   recallTypes: ["world", "experience"],
   recallTags: [],
   recallTagsMatch: "any",
+  reflectTimeoutMs: 20_000,
+  injectTimeoutMs: 8_000,
+  injectFailureAttempts: 2,
+  injectEmptyAttempts: 5,
+  minReflectPromptChars: 8,
+  coreRefreshPolicy: "session",
   retainEveryNTurns: 3,
   retainOverlapTurns: 2,
   retainContext: "opencode",
@@ -117,10 +144,18 @@ const ENV_OVERRIDES: Record<string, [keyof HindsightConfig, "string" | "bool" | 
   HINDSIGHT_BANK_ID: ["bankId", "string"],
   HINDSIGHT_AGENT_NAME: ["agentName", "string"],
   HINDSIGHT_AUTO_RECALL: ["autoRecall", "bool"],
+  HINDSIGHT_AUTO_INJECT: ["autoInject", "string"],
   HINDSIGHT_AUTO_RETAIN: ["autoRetain", "bool"],
   HINDSIGHT_RETAIN_MODE: ["retainMode", "string"],
   HINDSIGHT_RECALL_BUDGET: ["recallBudget", "string"],
   HINDSIGHT_RECALL_MAX_QUERY_CHARS: ["recallMaxQueryChars", "int"],
+  HINDSIGHT_MAX_RECALL_QUERY_TOKENS: ["maxRecallQueryTokens", "int"],
+  HINDSIGHT_REFLECT_TIMEOUT_MS: ["reflectTimeoutMs", "int"],
+  HINDSIGHT_INJECT_TIMEOUT_MS: ["injectTimeoutMs", "int"],
+  HINDSIGHT_INJECT_FAILURE_ATTEMPTS: ["injectFailureAttempts", "int"],
+  HINDSIGHT_INJECT_EMPTY_ATTEMPTS: ["injectEmptyAttempts", "int"],
+  HINDSIGHT_MIN_REFLECT_PROMPT_CHARS: ["minReflectPromptChars", "int"],
+  HINDSIGHT_CORE_REFRESH_POLICY: ["coreRefreshPolicy", "string"],
   HINDSIGHT_RECALL_CONTEXT_TURNS: ["recallContextTurns", "int"],
   HINDSIGHT_RETAIN_EVERY_N_TURNS: ["retainEveryNTurns", "int"],
   HINDSIGHT_RETAIN_OVERLAP_TURNS: ["retainOverlapTurns", "int"],
@@ -199,6 +234,49 @@ export function loadConfig(pluginOptions: HindsightPluginOptions = {}): Hindsigh
   const validTagsMatch: HindsightConfig["recallTagsMatch"][] = ["any", "all", "any_strict", "all_strict"];
   if (!validTagsMatch.includes(config.recallTagsMatch)) {
     config.recallTagsMatch = "any";
+  }
+
+  if (!Number.isFinite(config.maxRecallQueryTokens) || config.maxRecallQueryTokens <= 0) {
+    config.maxRecallQueryTokens = 500;
+  }
+
+  // autoInject migration: absent => derive from autoRecall so an explicit
+  // `autoRecall: false` keeps meaning "inject nothing". `autoRecall: true`
+  // (or unset) upgrades to the new once-per-session default ("reflect").
+  if (config.autoInject === undefined) {
+    config.autoInject = config.autoRecall === false ? "none" : "reflect";
+  }
+  const validInjectModes: HindsightConfig["autoInject"][] = ["reflect", "recall", "perMessage", "none"];
+  if (!validInjectModes.includes(config.autoInject)) {
+    config.autoInject = "reflect";
+  }
+
+  const validRefreshPolicies: HindsightConfig["coreRefreshPolicy"][] = ["session", "onInvalidate"];
+  if (!validRefreshPolicies.includes(config.coreRefreshPolicy)) {
+    config.coreRefreshPolicy = "session";
+  }
+
+  // Timeouts must be positive (0 would time out instantly); attempt budgets
+  // and the min-chars threshold legitimately allow 0 ("never retry" / "never
+  // skip"). Anything non-finite or negative falls back to the default.
+  for (const [key, fallback] of [
+    ["reflectTimeoutMs", 20_000],
+    ["injectTimeoutMs", 8_000],
+  ] as const) {
+    const value = config[key];
+    if (!Number.isFinite(value) || value <= 0) {
+      (config as unknown as Record<string, unknown>)[key] = fallback;
+    }
+  }
+  for (const [key, fallback] of [
+    ["injectFailureAttempts", 2],
+    ["injectEmptyAttempts", 5],
+    ["minReflectPromptChars", 8],
+  ] as const) {
+    const value = config[key];
+    if (!Number.isFinite(value) || value < 0) {
+      (config as unknown as Record<string, unknown>)[key] = fallback;
+    }
   }
 
   return config;

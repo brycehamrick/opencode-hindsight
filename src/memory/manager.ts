@@ -3,15 +3,24 @@ import type { Logger } from "../logger.js";
 import type { Message, PluginState, RecallResult } from "../types.js";
 import { saveState, type StorageContext } from "../state.js";
 import { deriveBankId } from "../bank.js";
-import { createHindsightClientWrapper } from "./client.js";
+import { diag, diagPreview } from "../diag.js";
+import { createHindsightClientWrapper, errorStatus } from "./client.js";
 import { createRecallEngine, type RecallEngine } from "./recall.js";
 import { createRetentionEngine, type RetentionEngine } from "./retain.js";
+import {
+  createInjectionEngine,
+  type InjectionEngine,
+  type InjectSourceResult,
+} from "../inject/engine.js";
+import { boundQueryTokens, fingerprintMessages, formatMemories } from "./content.js";
 import { formatMemoryContext, formatCurrentTime } from "./content.js";
 
 export interface MemoryManager {
   initialize(agentName?: string): Promise<void>;
   shutdown(): Promise<void>;
   setWorkspaceDirectory(directory: string): void;
+  /** Auto-inject engine (MEMORY_PIPELINE_PLAN.md WS2). */
+  injection: InjectionEngine;
   getCoreMemories(agentName?: string): Promise<RecallResult[]>;
   recallForMessage(message: string, recentMessages: Message[], agentName?: string): Promise<RecallResult[]>;
   recallByQuery(query: string, maxTokens?: number, agentName?: string): Promise<RecallResult[]>;
@@ -44,7 +53,10 @@ interface AgentEngines {
   recall: RecallEngine;
   retention: RetentionEngine;
   coreMemoryPromise: Promise<RecallResult[]> | null;
+  coreLoaded: boolean;
   bankMissionPromise: Promise<void> | null;
+  /** Cold-bank probe (null = not probed yet), cached per bank per process. */
+  bankCold: boolean | null;
 }
 
 export function createMemoryManager(deps: MemoryManagerDependencies): MemoryManager {
@@ -63,8 +75,9 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
   });
 
   const enginesByAgent = new Map<string, AgentEngines>();
+  /** Per-session write-back locks (serialization, WS4). */
+  const retainLocks = new Map<string, Promise<void>>();
   let initialized = false;
-
   function getEngines(agentName = defaultAgentName): AgentEngines {
     const existing = enginesByAgent.get(agentName);
     if (existing) return existing;
@@ -85,7 +98,9 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
       recall: createRecallEngine(client, bankId, config, logger),
       retention: createRetentionEngine(client, bankId, config, logger),
       coreMemoryPromise: null,
+      coreLoaded: false,
       bankMissionPromise: null,
+      bankCold: null,
     };
 
     enginesByAgent.set(agentName, engines);
@@ -133,9 +148,25 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     }
 
     // Pre-fetch core memory so first recall is fast.
-    engines.coreMemoryPromise = engines.recall.recallCoreMemories();
+    loadCoreMemories(engines);
 
     initialized = true;
+  }
+
+  /** Fetch (or refetch) an engine's core memory, tracking refreshes for
+   * diagnostics — a mid-session refetch only happens after an invalidation
+   * (a newly retained "core"-tagged fact), which is worth seeing in the log. */
+  function loadCoreMemories(engines: AgentEngines): Promise<RecallResult[]> {
+    const isRefresh = engines.coreLoaded;
+    const load = engines.recall.recallCoreMemories().then((results) => {
+      engines.coreLoaded = true;
+      if (isRefresh) {
+        diag("core_refresh", { count: results.length, bank: engines.bankId });
+      }
+      return results;
+    });
+    engines.coreMemoryPromise = load;
+    return load;
   }
 
   async function ensureBankMission(agentName = defaultAgentName): Promise<void> {
@@ -178,7 +209,7 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     if (!config.autoRecall) return [];
     const engines = getEngines(agentName ?? defaultAgentName);
     if (!engines.coreMemoryPromise) {
-      engines.coreMemoryPromise = engines.recall.recallCoreMemories();
+      return await loadCoreMemories(engines);
     }
     return await engines.coreMemoryPromise;
   }
@@ -208,16 +239,122 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     agentName?: string
   ): Promise<string> {
     const engines = getEngines(agentName ?? defaultAgentName);
+    const startedAt = Date.now();
+    const boundedQuery = boundQueryTokens(query, config.maxRecallQueryTokens);
     try {
-      const response = await client.reflect(engines.bankId, query, {
+      const response = await client.reflect(engines.bankId, boundedQuery, {
         context,
         budget: config.recallBudget,
       });
-      return response.text || "No relevant information found to reflect on.";
+      const text = response.text || "No relevant information found to reflect on.";
+      diag("reflect_ok", {
+        ms: Date.now() - startedAt,
+        chars: text.length,
+        query: diagPreview(boundedQuery),
+      });
+      return text;
     } catch (error) {
+      diag("reflect_failed", {
+        ms: Date.now() - startedAt,
+        error: String(error),
+        query: diagPreview(boundedQuery),
+      });
       logger.error("Reflect failed", { error: String(error), query });
       return "Unable to reflect on long-term memory right now.";
     }
+  }
+
+  /**
+   * Auto-inject source: one reflect synthesis, budget "low" (the supported
+   * budget for bounded reflect calls — the explicit hindsight_reflect tool
+   * keeps the deeper config.recallBudget path), classified for the engine's
+   * tri-state + attempt budgets. The deadline is owned by the client wrapper
+   * (TimeoutError is never retried at the transport level).
+   */
+  async function reflectSource(query: string, agentName?: string): Promise<InjectSourceResult> {
+    const engines = getEngines(agentName ?? defaultAgentName);
+    const startedAt = Date.now();
+    try {
+      const response = await client.reflect(engines.bankId, query, {
+        budget: "low",
+        timeoutMs: config.reflectTimeoutMs,
+      });
+      const text = response.text ?? "";
+      diag("reflect_ok", {
+        ms: Date.now() - startedAt,
+        chars: text.length,
+        query: diagPreview(query),
+      });
+      return { ok: true, body: text };
+    } catch (error) {
+      const permanent = isPermanentError(error);
+      diag("reflect_failed", {
+        ms: Date.now() - startedAt,
+        error: String(error),
+        permanent,
+        query: diagPreview(query),
+      });
+      return { ok: false, error: String(error), permanent };
+    }
+  }
+
+  /** Auto-inject source: one recall pass, formatted as a memory list. */
+  async function recallSource(query: string, agentName?: string): Promise<InjectSourceResult> {
+    const engines = getEngines(agentName ?? defaultAgentName);
+    const startedAt = Date.now();
+    try {
+      const response = await client.recall(engines.bankId, query, {
+        budget: config.recallBudget,
+        maxTokens: config.perMessageRecallMaxTokens,
+        types: config.recallTypes,
+        tags: config.recallTags.length ? config.recallTags : undefined,
+        timeoutMs: config.injectTimeoutMs,
+      });
+      const results = response.results ?? [];
+      diag("recall_ok", {
+        ms: Date.now() - startedAt,
+        count: results.length,
+        query: diagPreview(query),
+      });
+      return { ok: true, body: formatMemories(results) };
+    } catch (error) {
+      const permanent = isPermanentError(error);
+      diag("recall_failed", {
+        ms: Date.now() - startedAt,
+        error: String(error),
+        permanent,
+        query: diagPreview(query),
+      });
+      return { ok: false, error: String(error), permanent };
+    }
+  }
+
+  /**
+   * Cold-bank probe for the engine's one-time defer: a bank with no core
+   * memories and no probe hits has nothing to synthesize from. Cached per
+   * bank per process. An unreachable server reads warm — better to let the
+   * source fail (and retry per its budget) than to defer on an outage.
+   */
+  async function probeBankCold(agentName?: string): Promise<boolean> {
+    const engines = getEngines(agentName ?? defaultAgentName);
+    if (engines.bankCold !== null) return engines.bankCold;
+    const core = await getCoreMemories(agentName);
+    if (core.length) {
+      engines.bankCold = false;
+      return false;
+    }
+    try {
+      const response = await client.recall(engines.bankId, "project decisions conventions preferences setup", {
+        budget: "low",
+        maxTokens: 64,
+        types: config.recallTypes,
+        timeoutMs: config.injectTimeoutMs,
+      });
+      engines.bankCold = (response.results ?? []).length === 0;
+    } catch {
+      engines.bankCold = false;
+    }
+    return engines.bankCold;
   }
 
   async function retainTurns(
@@ -228,13 +365,50 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
   ): Promise<void> {
     if (!config.autoRetain || config.retainMode === "none") return;
 
+    // Per-session serialization (WS4): idle and execution signals can fire in
+    // quick succession for one exchange; racing two retains against the same
+    // state double-writes. Chained per session, never blocking other sessions.
+    const previous = retainLocks.get(sessionId) ?? Promise.resolve();
+    const run = previous
+      .catch(() => {})
+      .then(() => doRetainTurns(sessionId, turns, agentName, options));
+    retainLocks.set(sessionId, run);
+    try {
+      await run;
+    } finally {
+      if (retainLocks.get(sessionId) === run) retainLocks.delete(sessionId);
+    }
+  }
+
+  async function doRetainTurns(
+    sessionId: string,
+    turns: Message[],
+    agentName?: string,
+    options?: { finalFlush?: boolean }
+  ): Promise<void> {
+    if (!config.autoRetain || config.retainMode === "none" || !turns.length) return;
+
+    // Growth gate (WS4): an unchanged transcript (same shape, same content)
+    // means the signal that triggered us carried nothing new — skip before
+    // touching engines or state.
+    const fingerprint = fingerprintMessages(turns);
+    const session = (state.sessions[sessionId] ??= { lastRetainedTurn: 0 });
+    if (session.retainedFingerprint === fingerprint) {
+      logger.debug("Retention skipped: transcript unchanged", { sessionId });
+      return;
+    }
+
     const engines = getEngines(agentName ?? defaultAgentName);
-    state.sessions[sessionId] ??= { lastRetainedTurn: 0 };
-    const previousState = state.sessions[sessionId];
+    const previousState = session;
     const nextState = options?.finalFlush
       ? await engines.retention.flushFinalTurns(sessionId, turns, previousState)
       : await engines.retention.retainTurns(sessionId, turns, previousState);
     state.sessions[sessionId] = nextState;
+    // Record the fingerprint only when something was actually written — the
+    // turn gate may have held this call back, and a later signal that crosses
+    // the gate must still fire. Never erase a prior fingerprint on a no-op.
+    const wrote = nextState.lastRetainedTurn > previousState.lastRetainedTurn;
+    nextState.retainedFingerprint = wrote ? fingerprint : previousState.retainedFingerprint;
     await persistState();
 
     // Freshly retained memories may qualify as core ("core"-tagged); the
@@ -243,6 +417,8 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     if (engines.coreMemoryPromise) {
       engines.coreMemoryPromise = null;
     }
+    // Honor coreRefreshPolicy for the session's frozen core block.
+    injection.invalidateCore();
   }
 
   async function flushFinalTurns(sessionId: string, turns: Message[], agentName?: string): Promise<void> {
@@ -261,6 +437,7 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     // Explicit "core"-tagged facts should surface in core memory immediately.
     if (tags?.includes("core")) {
       engines.coreMemoryPromise = null;
+      injection.invalidateCore();
     }
   }
 
@@ -315,10 +492,25 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     return { directory: currentDirectory, bankId: engines.bankId, agent: name };
   }
 
+  // Auto-inject engine (WS2). Function declarations above hoist, so the deps
+  // can reference them directly; state persistence rides the same storage.
+  const injection = createInjectionEngine({
+    config,
+    state,
+    logger,
+    persistState,
+    reflectSource,
+    recallSource,
+    getCoreMemories,
+    recallForMessage,
+    isBankCold: probeBankCold,
+  });
+
   return {
     initialize,
     shutdown,
     setWorkspaceDirectory,
+    injection,
     getCoreMemories,
     recallForMessage,
     recallByQuery,
@@ -330,4 +522,12 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     onCompaction,
     getDiagnostics,
   };
+}
+
+/** A 4xx (except 429, which is a rate limit and transient) will fail
+ * identically on every retry — the injection engine resolves it immediately
+ * instead of spending its attempt budget. */
+function isPermanentError(error: unknown): boolean {
+  const status = errorStatus(error);
+  return status !== undefined && status >= 400 && status < 500 && status !== 429;
 }

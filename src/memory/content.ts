@@ -11,6 +11,47 @@ export function stripMemoryTags(content: string): string {
     .trim();
 }
 
+/**
+ * Full prompt hygiene: a superset of stripMemoryTags that also removes
+ * host-injected wrapper blocks. Hosts and other plugins prepend tagged blocks
+ * (a `<system-reminder>`, a `<context key="…">` instructions entry) ahead of
+ * the user's words; left in, that boilerplate becomes the head of every recall
+ * query and reflect goal, so the search runs on the wrapper and never reaches
+ * what the user actually asked.
+ */
+export function stripInjectedMemory(content: string): string {
+  return stripMemoryTags(
+    content
+      .replace(/<system-reminder\b[^>]*>[\s\S]*?<\/system-reminder>/g, "")
+      .replace(/<context\b[^>]*>[\s\S]*?<\/context>/g, "")
+  );
+}
+
+/**
+ * Byte-aware token bound for outgoing queries.
+ *
+ * Servers reject recall queries over ~500 tokens with HTTP 400, which costs
+ * the turn its memory on long or non-Latin prompts. A byte-level BPE token
+ * never covers less than one UTF-8 byte, so charging non-ASCII its byte length
+ * is a true ceiling; ASCII is conservatively charged at half a token per
+ * character. The cut preserves the query's head, where the user's ask lives.
+ *
+ * This is a *query-path* bound, distinct from estimateTokens (chars/4), which
+ * remains the rough cap for budget-trimming recalled results.
+ */
+export function boundQueryTokens(text: string, maxTokens: number): string {
+  if (maxTokens <= 0 || !text) return maxTokens <= 0 ? "" : text;
+  let cost = 0;
+  let end = 0;
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    cost += cp < 0x80 ? 0.5 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+    if (cost > maxTokens) break;
+    end += ch.length;
+  }
+  return text.slice(0, end);
+}
+
 /** Remove likely secrets and sensitive tokens from retained content. */
 export function stripSecrets(content: string): string {
   // Authorization / Bearer tokens
@@ -59,7 +100,7 @@ export function sanitizeForRetention(
   let sanitized = content;
   if (options.stripSecrets) sanitized = stripSecrets(sanitized);
   if (options.stripBase64) sanitized = stripBase64(sanitized);
-  sanitized = stripMemoryTags(sanitized);
+  sanitized = stripInjectedMemory(sanitized);
   if (sanitized.length > options.maxLength) {
     sanitized = sanitized.slice(0, options.maxLength) + "\n...[truncated]";
   }
@@ -79,7 +120,7 @@ export function composeRecallQuery(
   const contextLines: string[] = [];
 
   for (const msg of contextual) {
-    const content = stripMemoryTags(msg.content).trim();
+    const content = stripInjectedMemory(msg.content).trim();
     if (!content) continue;
     if (msg.role === "user" && content === latest) continue;
     contextLines.push(`${msg.role}: ${content}`);
@@ -209,4 +250,22 @@ export function formatCurrentTime(): string {
   const h = String(now.getUTCHours()).padStart(2, "0");
   const min = String(now.getUTCMinutes()).padStart(2, "0");
   return `${y}-${m}-${d} ${h}:${min}`;
+}
+
+/**
+ * Cheap stable fingerprint of a normalized transcript (djb2 over role +
+ * content + tool-trace names). Used by the write-back growth gate: idle and
+ * execution signals fire repeatedly for one exchange, and a retain must only
+ * happen when the transcript actually grew or changed.
+ */
+export function fingerprintMessages(messages: Message[]): string {
+  let hash = 5381;
+  for (const msg of messages) {
+    const trace = msg.toolCalls?.length ? `|t:${msg.toolCalls.map((c) => c.name).join(",")}` : "";
+    const part = `${msg.role} ${msg.content}${trace}`;
+    for (let i = 0; i < part.length; i++) {
+      hash = ((hash << 5) + hash + part.charCodeAt(i)) | 0;
+    }
+  }
+  return `${messages.length}:${(hash >>> 0).toString(16)}`;
 }

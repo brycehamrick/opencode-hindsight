@@ -2,9 +2,11 @@ import type { Message, RecallResult } from "../types.js";
 import type { Logger } from "../logger.js";
 import type { HindsightConfig } from "../config.js";
 import type { HindsightClientWrapper } from "./client.js";
+import { diag, diagPreview } from "../diag.js";
 import {
   composeRecallQuery,
   truncateRecallQuery,
+  boundQueryTokens,
   formatMemories,
   formatMemoryContext,
   formatCurrentTime,
@@ -31,6 +33,7 @@ export function createRecallEngine(
     tags?: string[],
     tagsMatch?: HindsightConfig["recallTagsMatch"]
   ): Promise<RecallResult[]> {
+    const startedAt = Date.now();
     try {
       const response = await client.recall(bankId, query, {
         budget: config.recallBudget,
@@ -39,13 +42,24 @@ export function createRecallEngine(
         tags,
         tagsMatch: tagsMatch ?? config.recallTagsMatch,
       });
-      return (response.results || []).map((r) => ({
+      const results = (response.results || []).map((r) => ({
         text: r.text,
         type: r.type ?? null,
         mentioned_at: r.mentioned_at ?? null,
         metadata: r.metadata ?? {},
       }));
+      diag("recall_ok", {
+        ms: Date.now() - startedAt,
+        count: results.length,
+        query: diagPreview(query),
+      });
+      return results;
     } catch (error) {
+      diag("recall_failed", {
+        ms: Date.now() - startedAt,
+        error: String(error),
+        query: diagPreview(query),
+      });
       logger.error("Recall failed", { error: String(error), query });
       return [];
     }
@@ -73,7 +87,13 @@ export function createRecallEngine(
     if (!config.autoRecall) return [];
 
     const composed = composeRecallQuery(message, recentMessages, config.recallContextTurns);
-    const query = truncateRecallQuery(composed, message, config.recallMaxQueryChars);
+    // Char cap first (keeps the composed structure), then the byte-aware
+    // token ceiling — old servers 400 on recall queries over 500 tokens, which
+    // silently cost long or non-Latin prompts their turn.
+    const query = boundQueryTokens(
+      truncateRecallQuery(composed, message, config.recallMaxQueryChars),
+      config.maxRecallQueryTokens
+    );
 
     const maxTokens = Math.min(
       config.perMessageRecallMaxTokens,
@@ -93,7 +113,7 @@ export function createRecallEngine(
   async function recallByQuery(query: string, maxTokens?: number): Promise<RecallResult[]> {
     const effectiveMaxTokens = maxTokens ?? config.perMessageRecallMaxTokens;
     const results = await callRecall(
-      query,
+      boundQueryTokens(query, config.maxRecallQueryTokens),
       Math.min(effectiveMaxTokens, budgetToTokens(config.recallBudget)),
       config.recallTypes,
       config.recallTags.length ? config.recallTags : undefined
@@ -107,7 +127,7 @@ export function createRecallEngine(
       budgetToTokens(config.recallBudget)
     );
     const results = await callRecall(
-      query,
+      boundQueryTokens(query, config.maxRecallQueryTokens),
       maxTokens,
       config.recallTypes,
       config.recallTags.length ? config.recallTags : undefined

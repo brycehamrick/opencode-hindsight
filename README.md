@@ -4,14 +4,15 @@ A best-in-class, token-efficient long-term memory plugin for [OpenCode](https://
 
 ## Features
 
-- **Per-message recall** — memories are fetched for the *current* user message, not just at session start.
-- **Core memory** — a small, always-injected block of high-stability facts (preferences, conventions).
+- **Once-per-session memory injection** — one reflect synthesis per session (default), injected as a byte-stable block so the provider's prefix cache stays valid; per-message recall available as `autoInject: "perMessage"`.
+- **Core memory** — a small, always-injected block of high-stability facts (preferences, conventions), frozen per session.
 - **Per-agent scoping** — different OpenCode agents can have isolated memory banks.
 - **Smart retention** — defaults to retaining atomic facts instead of full transcripts.
 - **Token budgets** — caps injected memory per turn to avoid wasting tokens.
 - **Safety** — strips secrets, API keys, base64 blobs, and large tool outputs before retention.
 - **Durable state** — plugin state survives restarts via `ctx.storage`.
 - **Explicit tools** — `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`, `hindsight_forget`.
+- **Diagnostics** — every recall/reflect/retain outcome logged to `~/.hindsight/diagnostics.log`.
 - **Self-hosted or hosted** — works with your own Hindsight instance or Hindsight Cloud.
 
 ## Installation
@@ -218,7 +219,14 @@ All explicit tools accept an optional `agent` parameter to target a specific age
 | `agentName` | `"opencode"` | Default agent name fallback |
 | `bankMission` | `""` | Mission set when creating a bank |
 | `retainMission` | `null` | Retain mission for the bank |
-| `autoRecall` | `true` | Recall memories per user message |
+| `autoRecall` | `true` | Legacy switch: `false` maps to `autoInject: "none"` |
+| `autoInject` | `"reflect"` | `"reflect"` — one reflect synthesis per session; `"recall"` — one recall per session; `"perMessage"` — per-message recall (legacy behavior); `"none"` — tools only |
+| `reflectTimeoutMs` | `20000` | Timeout for the once-per-session auto reflect (the `hindsight_reflect` tool is unaffected) |
+| `injectTimeoutMs` | `8000` | Timeout for the once-per-session recall source and the cold-bank probe |
+| `injectFailureAttempts` | `2` | Turns a failing auto-inject source may retry before giving up |
+| `injectEmptyAttempts` | `5` | Turns an empty auto-inject source may retry before giving up |
+| `minReflectPromptChars` | `8` | Prompts shorter than this skip auto-inject without consuming an attempt |
+| `coreRefreshPolicy` | `"session"` | `"session"` — core memory frozen for the session; `"onInvalidate"` — refetched after a core-tagged retain |
 | `autoRetain` | `true` | Retain conversation automatically |
 | `retainMode` | `"facts"` | `"facts"`, `"transcript"`, or `"none"` |
 | `coreMemoryMaxTokens` | `256` | Max tokens for always-injected core memory |
@@ -228,6 +236,7 @@ All explicit tools accept an optional `agent` parameter to target a specific age
 | `recallBudget` | `"mid"` | Hindsight recall budget (`low`/`mid`/`high`) |
 | `recallContextTurns` | `2` | User turns included in recall query context |
 | `recallMaxQueryChars` | `800` | Max characters in composed recall query |
+| `maxRecallQueryTokens` | `500` | Byte-aware token ceiling on recall/reflect queries (servers reject queries over ~500 tokens) |
 | `recallPromptPreamble` | (see source) | Preamble prepended to injected memory context |
 | `recallTypes` | `["world", "experience"]` | Memory types to recall |
 | `recallTags` | `[]` | Tags to filter recall |
@@ -256,6 +265,72 @@ Configuration priority (later wins):
 - `hindsight_recall(query, maxTokens?, agent?)` — search memory.
 - `hindsight_reflect(query, context?, agent?)` — synthesize an answer from memory.
 - `hindsight_forget(documentId?, query?, agent?)` — remove a memory by document ID.
+- `hindsight_status(agent?)` — resolved workspace, bank, and diagnostics-log path.
+
+## How memory is injected
+
+Memory is delivered through a **stored synthetic user message**, not the system
+prompt. The plugin registers the prompt-admission hook (`ctx.session.hook("prompt")`),
+which runs once per admitted user prompt: it recalls/synthesizes the block and
+sends it via `ctx.session.synthetic({ resume: false })`, so it lands just before
+your message, persists in the transcript, and is paid for once — every later
+request repeats it byte-for-byte at cache-read price while the system prompt
+(and therefore the provider's prefix cache) stays untouched. The block is
+delivered **on change only**: typically exactly one memory message per session.
+
+Hosts without `ctx.session.synthetic` (older v2 builds) fall back to the
+context-hook channel: the same frozen block is attached as a system part on
+every model call, byte-stable for the session, so the prefix cache is preserved
+either way. If synthetic delivery fails twice on the host, the plugin trips a
+circuit breaker and switches to that fallback for the rest of the process. The
+active channel is recorded in the diagnostics log (`inject_channel`).
+
+By default (`autoInject: "reflect"`), the block contains **one reflect
+synthesis per session** from the first substantive prompt, plus a frozen
+core-memory section. A failed synthesis does not cost the session its memory:
+one retrieval-only recall runs as a fallback (within `injectTimeoutMs`) and its
+result is injected exactly like a reflect answer; the failure still retries on
+later turns (at most `injectFailureAttempts` times), while a synthesis that
+matches nothing retries at most `injectEmptyAttempts` times. A permanent 4xx on
+reflect skips its retries but still gets the one fallback recall. Every step is
+recorded in the diagnostics log (`reflect_fallback*`, `inject_*`). A brand-new
+(cold) bank defers the first attempt
+once, and prompts shorter than `minReflectPromptChars` are skipped without
+consuming an attempt. Deeper memory is pulled on demand through the
+`hindsight_recall` / `hindsight_reflect` tools.
+
+If you prefer the older per-message recall (a fresh recall on every user
+message), set `autoInject: "perMessage"` — each turn's block is delivered as its
+own synthetic message, so context accumulates over the session (that is the
+cost of per-turn injection on a stored-message channel; the tools are usually
+the better pull channel). To disable all automatic injection and rely on the
+tools alone, set `autoInject: "none"` (also implied by `autoRecall: false`).
+
+## Session write-back
+
+When the assistant finishes a turn (`session.idle`, plus the
+`session.execution.*` signals that cover one-shot `opencode run` sessions), the
+plugin **refetches the session's transcript from the host** and retains it —
+the event payload predates the reply, so trusting it would lose every
+session's final exchange. Repeated signals for an unchanged transcript cost
+nothing (a fingerprint gate skips them), and only sessions this plugin
+instance admitted are ever written back — OpenCode's event stream is global
+across projects, and the admission guard keeps another project's idle event
+from touching your bank. On `session.closed`, the partial window the turn gate
+hasn't reached is flushed. Retention modes: `facts` (default — atomic
+fact-hash documents), `transcript` (a single document per session, upserted),
+or `none`. Compaction requests get a short memory-recall injection so
+summaries keep the session's context.
+
+## Diagnostics
+
+The plugin appends a JSONL event log to `~/.hindsight/diagnostics.log`
+(override with `HINDSIGHT_DIAG_FILE`; rotated to `.1` at ~1MB). Every memory
+outcome is recorded — `recall_ok` / `recall_failed`, `reflect_ok` /
+`reflect_failed`, `retain_ok` / `retain_failed`, `core_refresh` — with latency,
+result counts, and short query previews, so a memory-less session is
+distinguishable from a healthy one in the log. `hindsight_status` prints the
+path.
 
 ## Development
 
@@ -275,9 +350,35 @@ To use a local build in OpenCode, run `npm run build`, then point the `"package"
 
 See `examples/opencode.jsonc` and `examples/global-opencode.jsonc`.
 
+## Upgrading from 0.3.x
+
+0.4.0 rebuilds the memory pipeline (see
+[`MEMORY_PIPELINE_PLAN.md`](./MEMORY_PIPELINE_PLAN.md)). Things to know:
+
+- **Injection is now once per session by default.** One reflect synthesis is
+  injected as a stored synthetic user message instead of a fresh recall block
+  in the system prompt on every message. This keeps the provider's prefix
+  cache valid — the system prompt no longer changes turn to turn — and cuts
+  memory API calls from one per message to a handful per session.
+- **Prefer the old behavior?** Set `"autoInject": "perMessage"` (fresh recall
+  per message) or `"autoInject": "none"` (tools only). `autoRecall: false`
+  still disables all automatic injection.
+- **Retention is safer.** Session close now flushes the final partial window,
+  completed replies are captured by refetching the transcript on idle, and
+  only sessions this plugin instance admitted are written back (OpenCode's
+  event stream is global across projects).
+- Existing banks and documents keep working; the new per-session state is
+  additive. A `hindsight_status` call prints the resolved bank and the
+  diagnostics log path, and `~/.hindsight/diagnostics.log` records every
+  recall/reflect/inject/retain outcome if anything looks off.
+
 ## Status
 
-This plugin requires OpenCode v2.0 or newer and is **not** compatible with OpenCode V1. Built for and tested against opencode v2.0.27.
+Requires OpenCode v2.0 or newer; not compatible with OpenCode V1. Built for
+and tested against opencode v2.0.27. The 0.4.x pipeline (once-per-session
+reflect injection, synthetic-message channel, fallback chain, idle-refetch
+write-back) is verified by 154 tests plus a structural benchmark
+(`npm run bench`) that gates the prefix-cache invariant in CI.
 
 ## License
 

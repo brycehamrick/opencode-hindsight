@@ -30,6 +30,28 @@ export interface PluginState {
   sessions: Record<string, SessionState>;
 }
 
+/**
+ * Per-session auto-inject state (tri-state). "unresolved" means the source
+ * has not produced an answer yet — either not run, or failed within its
+ * attempt budget — and a later turn may try again. "empty" is terminal: the
+ * source ran (or exhausted its budget) and there is nothing to inject.
+ * "answer" holds the frozen synthesis body.
+ *
+ * Persisted so a plugin reload does not re-synthesize or lose the budget
+ * count.
+ */
+export interface InjectState {
+  status: "unresolved" | "empty" | "answer";
+  failAttempts: number;
+  emptyAttempts: number;
+  /** Frozen answer body (status "answer"). */
+  text?: string;
+  /** Excerpt of the prompt the answer was recalled for (provenance). */
+  goalExcerpt?: string;
+  /** Cold-bank deferral consumed yet? (one free skip on a brand-new bank) */
+  coldDeferred?: boolean;
+}
+
 export interface SessionState {
   lastRetainedTurn: number;
   lastRecallQuery?: string;
@@ -38,4 +60,15 @@ export interface SessionState {
   /** User-turn count already covered by a final flush (session close),
    * so a later idle fire for the same window doesn't re-retain it. */
   lastFinalFlushTurn?: number;
+  /** Write-back growth gate: fingerprint of the transcript at the last
+   * successful retain. Repeated idle/execution signals for an unchanged
+   * transcript cost nothing. */
+  retainedFingerprint?: string;
+  // ── auto-inject (MEMORY_PIPELINE_PLAN.md WS2) ────────────────────────────
+  startedAt?: string;
+  /** Admitted user turns seen (prompt-text boundaries). */
+  turns?: number;
+  inject?: InjectState;
+  /** Frozen core-memory section for this session (byte-stable by design). */
+  coreBlock?: string | null;
 }

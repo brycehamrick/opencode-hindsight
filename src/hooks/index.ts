@@ -1,40 +1,59 @@
-import type { Message, RecallResult } from "../types.js";
+/**
+ * Hook registration (MEMORY_PIPELINE_PLAN.md WS1/WS4/WS6).
+ *
+ * Wires the injection channel (prompt-admission + synthetic message, with the
+ * context-hook fallback), the compaction hook, and the lifecycle write-back,
+ * and owns the `ownSessions` admission set that keeps the GLOBAL event stream
+ * from ever acting on another project's sessions.
+ */
+
 import type { MemoryManager } from "../memory/manager.js";
-import { formatMemoryContext } from "../memory/content.js";
+import { diag, diagFlush } from "../diag.js";
+import { registerPromptHook, type ChannelState } from "./prompt.js";
+import { registerLifecycle } from "./lifecycle.js";
+import {
+  createSessionWorkspaceResolver,
+  findLastUserMessageText,
+  normalizeMessages,
+  normalizeMessagesWithToolCalls,
+  resolveAgentName,
+} from "./shared.js";
 
 export async function registerHooks(ctx: any, memory: MemoryManager): Promise<() => void> {
-  // Cache per-message recall results keyed by the latest user message content.
-  const recallCache = new Map<string, RecallResult[]>();
-  // Cache sessionID -> workspace directory so each session's bank derivation
-  // uses the directory the session actually runs in.
-  const sessionDirectories = new Map<string, string>();
+  const ensureSessionWorkspace = createSessionWorkspaceResolver(ctx, memory);
+  /**
+   * Sessions THIS plugin instance owns. `event.subscribe` is global across
+   * every project the host serves and its envelopes carry no location, so
+   * only sessions admitted by our own scoped hooks are eligible for
+   * write-back — the hard bank-isolation guard (WS4).
+   */
+  const ownSessions = new Set<string>();
 
-  async function ensureSessionWorkspace(sessionID: unknown): Promise<void> {
-    if (typeof sessionID !== "string" || !sessionID) return;
-    if (sessionDirectories.has(sessionID)) {
-      memory.setWorkspaceDirectory(sessionDirectories.get(sessionID)!);
-      return;
-    }
-    try {
-      const session = await ctx.session?.get?.({ sessionID });
-      const directory = session?.location?.directory;
-      if (typeof directory === "string" && directory.trim()) {
-        sessionDirectories.set(sessionID, directory);
-        // Cap cache size.
-        if (sessionDirectories.size > 500) {
-          const first = sessionDirectories.keys().next().value;
-          if (first) sessionDirectories.delete(first);
-        }
-        memory.setWorkspaceDirectory(directory);
-      }
-    } catch {
-      // Fail open — keep the existing workspace directory.
-    }
-  }
+  // Injection channel (WS1): "synthetic" (prompt-admission + stored synthetic
+  // message — system prompt untouched, prefix cache preserved) with a
+  // circuit-breaker fallback to "system" (context hook + frozen block, the
+  // Phase-1 channel) for hosts that cannot deliver synthetic messages.
+  const channelState: ChannelState = { channel: "system" };
+  const promptWired = await registerPromptHook(
+    ctx,
+    memory,
+    ensureSessionWorkspace,
+    channelState,
+    ownSessions
+  );
+  if (promptWired) channelState.channel = "synthetic";
+  diag("inject_channel", { channel: channelState.channel });
 
-  // Per-message recall + core memory.
+  // Context-hook channel: admits every session it serves (the guard's other
+  // feeder) and pushes the frozen block ONLY when the synthetic channel is
+  // not active — it must never duplicate a block already delivered as a
+  // stored message.
   await ctx.session.hook("context", async (event: any) => {
     try {
+      if (typeof event?.sessionID === "string" && event.sessionID) {
+        ownSessions.add(event.sessionID);
+      }
+      if (channelState.channel !== "system") return;
       await ensureSessionWorkspace(event.sessionID);
       const agentName = resolveAgentName(event);
       const lastUserText = findLastUserMessageText(event.messages);
@@ -42,221 +61,55 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
       // plugin's internal { role, content } shape for recall composition.
       const messages = normalizeMessages(event.messages ?? []);
 
-      // Always inject core memory (small, stable facts).
-      const core = await memory.getCoreMemories(agentName);
-
-      // On-demand recall for the current user message.
-      let recalled: RecallResult[] = [];
-      if (lastUserText) {
-        const key = `${agentName}:${lastUserText}`;
-        const cached = recallCache.get(key);
-        if (cached) {
-          recalled = cached;
-        } else {
-          recalled = await memory.recallForMessage(lastUserText, messages, agentName);
-          recallCache.set(key, recalled);
-          // Cap cache size.
-          if (recallCache.size > 100) {
-            const first = recallCache.keys().next().value;
-            if (first) recallCache.delete(first);
-          }
-        }
-      }
-
-      // Dedupe recalled results against core memory.
-      const coreTexts = new Set(core.map((m) => m.text.trim().toLowerCase()));
-      const uniqueRecalled = recalled.filter((m) => !coreTexts.has(m.text.trim().toLowerCase()));
-
-      const contextText = formatMemoryContext([...core, ...uniqueRecalled], {
-        preamble:
-          "Relevant memories from past conversations (prioritize recent when conflicting). " +
-          "Only use memories that are directly useful; ignore the rest.",
-        maxTokens: event.budget?.memory ?? 768,
+      const block = await memory.injection.onModelCall({
+        sessionId: event.sessionID,
+        agent: agentName,
+        prompt: lastUserText,
+        messages,
+        budgetTokens: event.budget?.memory,
       });
 
       // OpenCode's system parts are structured values ({ type: "text", text }),
       // not raw strings — pushing a bare string fails host-side validation.
-      if (contextText && Array.isArray(event.system)) {
-        event.system.push({ type: "text", text: contextText });
+      if (block && Array.isArray(event.system)) {
+        event.system.push({ type: "text", text: block });
       }
     } catch (error) {
       // Fail open so OpenCode keeps working even if Hindsight is down.
+      diag("context_hook_failed", { error: String(error) });
       console.error("[hindsight] Context hook error:", error);
     }
   });
 
-  // Idle / session end retention.
-  const controller = new AbortController();
-  void (async () => {
-    for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-      try {
-        if (event.type === "session.idle" || event.type === "session.closed") {
-          const sessionId = event.properties?.sessionID ?? event.sessionID;
-          if (!sessionId) continue;
-
-          await ensureSessionWorkspace(sessionId);
-          const messages = event.messages ?? (await getSessionMessages(ctx, sessionId));
-          if (messages.length) {
-            const agentName = resolveAgentName(event);
-            // session.closed: flush the partial window the turn gate never
-            // reached, so the session's final turns aren't lost.
-            // session.idle: normal gated retention (a later closed event, or
-            // the next idle with more turns, covers anything left over).
-            await memory.retainTurns(
-              sessionId,
-              normalizeMessagesWithToolCalls(event.messages) ?? messages,
-              agentName,
-              { finalFlush: event.type === "session.closed" }
-            );
-          }
-        }
-      } catch (error) {
-        // Fail open — do not crash the event stream.
-        console.error("[hindsight] Event hook error:", error);
+  // Compaction hook (WS6): checkpoint summaries are their own request kind —
+  // retain any pending turns first (already onCompaction's first step), then
+  // inject a short recall so the summary keeps the session's memory context.
+  await ctx.session.hook("compaction", async (event: any) => {
+    try {
+      if (typeof event?.sessionID === "string" && event.sessionID) {
+        ownSessions.add(event.sessionID);
       }
-    }
-  })();
-
-  return () => controller.abort();
-}
-
-function resolveAgentName(event: any): string | undefined {
-  // OpenCode passes the agent as a branded string ID on session context
-  // events; older/other events may carry an object or agentID field.
-  if (typeof event?.agent === "string") return event.agent;
-  return (
-    event.agent?.id ??
-    event.session?.agent?.id ??
-    event.agentID ??
-    event.agentName ??
-    undefined
-  );
-}
-
-/**
- * Find the latest user message and extract its text.
- *
- * Message content is either a plain string (older hosts) or an array of
- * content parts ({ type: "text", text }) in the current OpenCode/AI SDK
- * format, so normalize both.
- */
-function findLastUserMessageText(messages: any[] = []): string | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message?.role !== "user") continue;
-    const text = messageText(message);
-    if (text.trim()) return text;
-  }
-  return undefined;
-}
-
-function messageText(message: any): string {
-  const content = message?.content;
-  if (typeof content === "string") return content;
-  return extractTextParts(content ?? message?.parts);
-}
-
-async function getSessionMessages(
-  ctx: any,
-  sessionId: string
-): Promise<Message[]> {
-  // Best-effort retrieval of session messages for retention.
-  // V2 may expose messages via ctx.session.messages, ctx.session.get, or event payloads.
-  try {
-    if (typeof ctx.session?.messages === "function") {
-      const response = await ctx.session.messages({ path: { id: sessionId } });
-      return normalizeMessages(response.data ?? response);
-    }
-    if (typeof ctx.session?.get === "function") {
-      const response = await ctx.session.get({ sessionID: sessionId });
-      return normalizeMessages(response.messages ?? response.data?.messages ?? []);
-    }
-  } catch {
-    // Fall through to empty.
-  }
-  return [];
-}
-
-/** Tools whose activity is pure plumbing; excluded from retained traces. */
-const OPERATIONAL_TOOL_PARTS = new Set([
-  "read", "write", "bash", "glob", "grep", "ls", "list", "cat",
-  "sed", "awk", "find", "head", "tail", "process", "spawn",
-]);
-
-/**
- * Extract compact tool-call traces from raw host message parts.
- * Handles the tool-part shapes seen across opencode builds:
- * { type: "tool", tool, state: { input, title/status } } and legacy
- * { type: "toolCall", tool, input }. Returns undefined when the payload
- * carries no recognizable tool parts (older hosts), so callers can keep
- * their existing message normalization.
- */
-function extractToolTraces(parts: any): { name: string; summary?: string; inputJson?: string }[] | undefined {
-  if (!Array.isArray(parts)) return undefined;
-  const traces: { name: string; summary?: string; inputJson?: string }[] = [];
-  for (const part of parts) {
-    if (!part || typeof part !== "object") continue;
-    if (part.type === "tool" || part.type === "toolCall") {
-      const name = part.tool ?? part.name;
-      if (typeof name !== "string" || !name) continue;
-      if (OPERATIONAL_TOOL_PARTS.has(name)) continue;
-      const state = part.state ?? {};
-      const input = state.input ?? part.input;
-      let inputJson: string | undefined;
-      if (input != null) {
-        try {
-          inputJson = JSON.stringify(input);
-        } catch {
-          inputJson = undefined;
-        }
+      await ensureSessionWorkspace(event.sessionID);
+      const messages = normalizeMessagesWithToolCalls(event.messages) ?? normalizeMessages(event.messages ?? []);
+      const context = await memory.onCompaction(event.sessionID, messages, resolveAgentName(event));
+      if (context && Array.isArray(event.system)) {
+        event.system.push({ type: "text", text: context });
+        diag("compaction_inject", { session: event.sessionID, chars: context.length });
       }
-      traces.push({
-        name,
-        summary: typeof state.title === "string" ? state.title : undefined,
-        inputJson,
-      });
+    } catch (error) {
+      // Fail open — compaction must proceed even if memory is unreachable.
+      diag("compaction_hook_failed", { error: String(error) });
     }
-  }
-  return traces.length ? traces : undefined;
-}
+  });
 
-function normalizeMessagesWithToolCalls(raw: any): Message[] | undefined {
-  if (!Array.isArray(raw)) return undefined;
-  const messages = normalizeMessages(raw);
-  // normalizeMessages drops tool parts; re-attach traces by index for the
-  // assistant messages that had them.
-  let attached = 0;
-  for (let i = 0; i < raw.length && i < messages.length; i++) {
-    const source = raw[i];
-    if (!source || typeof source !== "object") continue;
-    const role = source.info?.role ?? source.role;
-    if (role !== "assistant") continue;
-    const traces = extractToolTraces(source.parts ?? source.content);
-    if (traces) {
-      messages[i].toolCalls = traces;
-      attached++;
-    }
-  }
-  return attached ? messages : messages;
-}
+  // Lifecycle write-back (WS4): idle-family signals refetch the authoritative
+  // transcript; bank isolation via ownSessions; fire-and-forget retains with
+  // a bounded flush on cleanup.
+  const lifecycleCleanup = registerLifecycle(ctx, memory, ownSessions, ensureSessionWorkspace);
 
-function normalizeMessages(raw: any[]): Message[] {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .map((msg: any) => {
-      const role = msg.info?.role ?? msg.role ?? "unknown";
-      const content = extractTextParts(msg.parts ?? msg.content);
-      return { role, content };
-    })
-    .filter((m) => (m.role === "user" || m.role === "assistant") && m.content.trim()) as Message[];
-}
-
-function extractTextParts(parts: any): string {
-  if (typeof parts === "string") return parts;
-  if (!Array.isArray(parts)) return "";
-  return parts
-    .filter((p: any) => p.type === "text" || typeof p === "string")
-    .map((p: any) => (typeof p === "string" ? p : p.text))
-    .filter(Boolean)
-    .join("\n");
+  return () => {
+    lifecycleCleanup();
+    // Last diagnostics lines of a session should survive the process.
+    void diagFlush();
+  };
 }

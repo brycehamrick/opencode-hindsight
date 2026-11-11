@@ -24,10 +24,18 @@ function createEngine(configOverrides: Partial<HindsightConfig> = {}) {
     recallBudget: "mid",
     recallContextTurns: 2,
     recallMaxQueryChars: 200,
+    maxRecallQueryTokens: 500,
     recallPromptPreamble: "prompt",
     recallTypes: ["world", "experience"],
     recallTags: [],
     recallTagsMatch: "any",
+    autoInject: "reflect",
+    reflectTimeoutMs: 20_000,
+    injectTimeoutMs: 8_000,
+    injectFailureAttempts: 2,
+    injectEmptyAttempts: 5,
+    minReflectPromptChars: 8,
+    coreRefreshPolicy: "session",
     retainContext: "opencode",
     retainEveryNTurns: 1,
     retainOverlapTurns: 0,
@@ -126,7 +134,7 @@ describe("RetentionEngine", () => {
     expect(mockClient.retain).not.toHaveBeenCalled();
   });
 
-  it("retains transcript chunks and deletes previous chunk", async () => {
+  it("transcript mode upserts ONE document per session (no chunk lifecycle)", async () => {
     const { engine, mockClient } = createEngine({ retainMode: "transcript", retainEveryNTurns: 1 });
     const turns: Message[] = [
       { role: "user", content: "hello" },
@@ -136,18 +144,22 @@ describe("RetentionEngine", () => {
     let state: SessionState = { lastRetainedTurn: 0 };
     state = await engine.retainTurns("sess-1", turns, state);
     expect(state.lastRetainedTurn).toBe(1);
-    expect(mockClient.deleteDocument).not.toHaveBeenCalled();
 
-    const firstDocId = mockClient.retain.mock.calls[0][2].documentId;
-    expect(firstDocId).toContain("sess-1");
+    const [bank, firstContent, firstOptions] = mockClient.retain.mock.calls[0];
+    expect(bank).toBe("test-bank");
+    expect(firstOptions.documentId).toBe("sess-1");
+    expect(firstContent).toContain("hello");
 
+    // A grown transcript upserts the SAME document — no chunks to delete.
     const turns2: Message[] = [
       ...turns,
       { role: "user", content: "next" },
       { role: "assistant", content: "ok" },
     ];
-    state = await engine.retainTurns("sess-2", turns2, state);
-    expect(mockClient.deleteDocument).toHaveBeenCalledWith("test-bank", firstDocId);
+    state = await engine.retainTurns("sess-1", turns2, state);
+    expect(mockClient.retain).toHaveBeenCalledTimes(2);
+    expect(mockClient.retain.mock.calls[1][2].documentId).toBe("sess-1");
+    expect(mockClient.deleteDocument).not.toHaveBeenCalled();
   });
 
   it("returns early when retainMode is none", async () => {

@@ -16,6 +16,8 @@ export interface RecallOptions {
   tagsMatch?: "any" | "all" | "any_strict" | "all_strict";
   /** Sent automatically as the current time when unset (see recall below). */
   queryTimestamp?: string;
+  /** Per-call deadline in ms. Rejects with a TimeoutError (not retried). */
+  timeoutMs?: number;
 }
 
 export interface RetainOptions {
@@ -29,6 +31,43 @@ export interface RetainOptions {
 export interface ReflectOptions {
   context?: string;
   budget?: RecallBudget;
+  /** Per-call deadline in ms. Rejects with a TimeoutError (not retried). */
+  timeoutMs?: number;
+}
+
+/**
+ * A per-call deadline expired. Deliberately shaped so withRetry will NOT
+ * retry it (no status, no retryable code) — retry budgets belong to the
+ * injection engine, not the transport.
+ *
+ * The underlying SDK (hindsight-client 0.5.x) accepts no AbortSignal, so the
+ * request itself keeps draining; the wrapper simply stops waiting. Real
+ * wire-level cancellation arrives with a pages-capable client upgrade.
+ */
+export class TimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`timeout after ${timeoutMs}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+/** Race an operation against a deadline; ignore a late resolution. */
+function raceTimeout<T>(operation: () => Promise<T>, timeoutMs: number | undefined): Promise<T> {
+  if (timeoutMs === undefined) return operation();
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new TimeoutError(timeoutMs)), timeoutMs);
+    timer.unref?.();
+    operation().then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 export interface RecallResponse {
@@ -81,7 +120,9 @@ async function withRetry<T>(
   throw lastError;
 }
 
-function errorStatus(error: unknown): number | undefined {
+/** Best-effort HTTP status off a thrown client error (used to classify
+ * auto-inject failures: 4xx is permanent, everything else retries). */
+export function errorStatus(error: unknown): number | undefined {
   if (error && typeof error === "object") {
     const status = (error as { status?: number }).status;
     if (typeof status === "number") return status;
@@ -133,19 +174,20 @@ export class HindsightClientWrapper {
   }
 
   async recall(bankId: string, query: string, options: RecallOptions): Promise<RecallResponse> {
-    return await withRetry(
+    const { timeoutMs, ...callOptions } = options;
+    return await raceTimeout(
       () =>
-        this.client.recall(bankId, query, {
-          budget: options.budget,
-          maxTokens: options.maxTokens,
-          types: options.types,
-          tags: options.tags,
-          tagsMatch: options.tagsMatch,
-          // Temporal retrieval keys off this; a missing timestamp degrades
-          // recency-sensitive queries. Always send "now" unless overridden.
-          queryTimestamp: options.queryTimestamp ?? new Date().toISOString(),
-        }),
-      this.logger
+        withRetry(
+          () =>
+            this.client.recall(bankId, query, {
+              ...callOptions,
+              // Temporal retrieval keys off this; a missing timestamp degrades
+              // recency-sensitive queries. Always send "now" unless overridden.
+              queryTimestamp: callOptions.queryTimestamp ?? new Date().toISOString(),
+            }),
+          this.logger
+        ),
+      timeoutMs
     );
   }
 
@@ -164,13 +206,18 @@ export class HindsightClientWrapper {
   }
 
   async reflect(bankId: string, query: string, options: ReflectOptions = {}): Promise<ReflectResponse> {
-    return await withRetry(
+    const { timeoutMs, ...callOptions } = options;
+    return await raceTimeout(
       () =>
-        this.client.reflect(bankId, query, {
-          context: options.context,
-          budget: options.budget,
-        }),
-      this.logger
+        withRetry(
+          () =>
+            this.client.reflect(bankId, query, {
+              context: callOptions.context,
+              budget: callOptions.budget,
+            }),
+          this.logger
+        ),
+      timeoutMs
     );
   }
 

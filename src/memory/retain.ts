@@ -1,7 +1,8 @@
 import type { Message, PluginState, SessionState } from "../types.js";
 import type { Logger } from "../logger.js";
 import type { HindsightConfig } from "../config.js";
-import type { HindsightClientWrapper } from "./client.js";
+import type { HindsightClientWrapper, RetainOptions } from "./client.js";
+import { diag } from "../diag.js";
 import {
   sanitizeForRetention,
   sliceLastTurnsByUserBoundary,
@@ -35,6 +36,26 @@ export function createRetentionEngine(
 ): RetentionEngine {
   const pendingRetains = new Set<string>();
 
+  /**
+   * client.retain + diagnostics. Every successful write gets a retain_ok line
+   * so the log answers "what did the plugin actually store" without server
+   * access; failures propagate to the caller's fail-open handling.
+   */
+  async function retainTracked(
+    content: string,
+    options: RetainOptions,
+    sessionId?: string
+  ): Promise<void> {
+    const startedAt = Date.now();
+    await client.retain(bankId, content, options);
+    diag("retain_ok", {
+      ms: Date.now() - startedAt,
+      chars: content.length,
+      docId: options.documentId,
+      session: sessionId,
+    });
+  }
+
   async function retainFact(
     fact: string,
     context?: string,
@@ -60,13 +81,16 @@ export function createRetentionEngine(
     pendingRetains.add(key);
 
     try {
-      await client.retain(bankId, content, {
-        context: context || config.retainContext,
-        documentId,
-        tags: [...config.retainTags, "fact", "tool", ...(tags ?? [])],
-        metadata: { ...config.retainMetadata, ...metadata },
-        async: true,
-      });
+      await retainTracked(
+        content,
+        {
+          context: context || config.retainContext,
+          documentId,
+          tags: [...config.retainTags, "fact", "tool", ...(tags ?? [])],
+          metadata: { ...config.retainMetadata, ...metadata },
+          async: true,
+        }
+      );
       logger.debug("Retained fact", { documentId, length: content.length });
     } finally {
       pendingRetains.delete(key);
@@ -134,17 +158,21 @@ export function createRetentionEngine(
         pendingRetains.add(key);
 
         try {
-          await client.retain(bankId, content, {
-            context: config.retainContext,
-            documentId,
-            tags: [...config.retainTags, "fact", "final"],
-            metadata: {
-              ...config.retainMetadata,
-              session_id: sessionId,
-              retained_at: new Date().toISOString(),
+          await retainTracked(
+            content,
+            {
+              context: config.retainContext,
+              documentId,
+              tags: [...config.retainTags, "fact", "final"],
+              metadata: {
+                ...config.retainMetadata,
+                session_id: sessionId,
+                retained_at: new Date().toISOString(),
+              },
+              async: true,
             },
-            async: true,
-          });
+            sessionId
+          );
           retained++;
         } finally {
           pendingRetains.delete(key);
@@ -170,18 +198,22 @@ export function createRetentionEngine(
     }
 
     const documentId = `${sessionId}-final`;
-    await client.retain(bankId, parts.join("\n\n"), {
-      context: config.retainContext,
-      documentId,
-      tags: [...config.retainTags, "transcript", "final"],
-      metadata: {
-        ...config.retainMetadata,
-        session_id: sessionId,
-        user_turns: String(userTurns),
-        retained_at: new Date().toISOString(),
+    await retainTracked(
+      parts.join("\n\n"),
+      {
+        context: config.retainContext,
+        documentId,
+        tags: [...config.retainTags, "transcript", "final"],
+        metadata: {
+          ...config.retainMetadata,
+          session_id: sessionId,
+          user_turns: String(userTurns),
+          retained_at: new Date().toISOString(),
+        },
+        async: true,
       },
-      async: true,
-    });
+      sessionId
+    );
 
     logger.debug("Final flush retained transcript tail", { sessionId, documentId, pending });
     return {
@@ -221,17 +253,21 @@ export function createRetentionEngine(
       pendingRetains.add(key);
 
       try {
-        await client.retain(bankId, content, {
-          context: config.retainContext,
-          documentId,
-          tags: [...config.retainTags, "fact", "auto"],
-          metadata: {
-            ...config.retainMetadata,
-            session_id: sessionId,
-            retained_at: new Date().toISOString(),
+        await retainTracked(
+          content,
+          {
+            context: config.retainContext,
+            documentId,
+            tags: [...config.retainTags, "fact", "auto"],
+            metadata: {
+              ...config.retainMetadata,
+              session_id: sessionId,
+              retained_at: new Date().toISOString(),
+            },
+            async: true,
           },
-          async: true,
-        });
+          sessionId
+        );
         retained++;
       } finally {
         pendingRetains.delete(key);
@@ -242,6 +278,13 @@ export function createRetentionEngine(
     return { ...state, lastRetainedTurn: userTurns };
   }
 
+  /**
+   * Transcript mode: ONE document per session (`documentId = sessionId`),
+   * upserted with the full sanitized transcript each time the turn gate
+   * passes. The old chunked windowing + delete-previous-chunk dance is gone:
+   * the server upserts by document id and the growth gate upstream suppresses
+   * redundant writes, so there is nothing to clean up.
+   */
   async function retainTranscriptChunks(
     sessionId: string,
     turns: Message[],
@@ -252,30 +295,8 @@ export function createRetentionEngine(
       return state;
     }
 
-    const retainFullWindow = config.retainMode === "transcript"; // always chunked in this engine
-    let targetMessages: Message[];
-    let documentId: string;
-
-    if (retainFullWindow) {
-      targetMessages = turns;
-      documentId = sessionId;
-    } else {
-      const windowTurns = config.retainEveryNTurns + config.retainOverlapTurns;
-      targetMessages = sliceLastTurnsByUserBoundary(turns, windowTurns);
-      documentId = `${sessionId}-${userTurns}`;
-    }
-
-    // Delete the previous chunked transcript so we don't accumulate overlapping chunks.
-    if (state.lastTranscriptDocumentId && state.lastTranscriptDocumentId !== documentId) {
-      try {
-        await client.deleteDocument(bankId, state.lastTranscriptDocumentId);
-      } catch {
-        // Ignore delete failures; the chunk will simply coexist.
-      }
-    }
-
     const parts: string[] = [];
-    for (const msg of targetMessages) {
+    for (const msg of turns) {
       const content = messageContentForRetention(msg);
       if (!content) continue;
       parts.push(`[role: ${msg.role}]\n${content}\n[${msg.role}:end]`);
@@ -286,21 +307,25 @@ export function createRetentionEngine(
     const transcript = parts.join("\n\n");
     if (transcript.trim().length < 10) return state;
 
-    await client.retain(bankId, transcript, {
-      context: config.retainContext,
-      documentId,
-      tags: [...config.retainTags, "transcript", "auto"],
-      metadata: {
-        ...config.retainMetadata,
-        session_id: sessionId,
-        user_turns: String(userTurns),
-        retained_at: new Date().toISOString(),
+    await retainTracked(
+      transcript,
+      {
+        context: config.retainContext,
+        documentId: sessionId,
+        tags: [...config.retainTags, "transcript", "auto"],
+        metadata: {
+          ...config.retainMetadata,
+          session_id: sessionId,
+          user_turns: String(userTurns),
+          retained_at: new Date().toISOString(),
+        },
+        async: true,
       },
-      async: true,
-    });
+      sessionId
+    );
 
-    logger.debug("Retained transcript chunk", { sessionId, documentId, userTurns });
-    return { ...state, lastRetainedTurn: userTurns, lastTranscriptDocumentId: documentId };
+    logger.debug("Retained transcript upsert", { sessionId, userTurns });
+    return { ...state, lastRetainedTurn: userTurns };
   }
 
   /** Sanitized, tool-trace-enriched content for one message. */

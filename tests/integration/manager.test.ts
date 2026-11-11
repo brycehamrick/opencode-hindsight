@@ -14,6 +14,7 @@ const mockClient = {
 
 vi.mock("../../src/memory/client.js", () => ({
   createHindsightClientWrapper: vi.fn(() => mockClient),
+  errorStatus: () => undefined,
 }));
 
 function createManager(overrides: Partial<HindsightConfig> = {}) {
@@ -36,10 +37,18 @@ function createManager(overrides: Partial<HindsightConfig> = {}) {
     recallBudget: "mid",
     recallContextTurns: 2,
     recallMaxQueryChars: 200,
+    maxRecallQueryTokens: 500,
     recallPromptPreamble: "prompt",
     recallTypes: ["world", "experience"],
     recallTags: [],
     recallTagsMatch: "any",
+    autoInject: "reflect",
+    reflectTimeoutMs: 20_000,
+    injectTimeoutMs: 8_000,
+    injectFailureAttempts: 2,
+    injectEmptyAttempts: 5,
+    minReflectPromptChars: 8,
+    coreRefreshPolicy: "session",
     retainContext: "opencode",
     retainEveryNTurns: 1,
     retainOverlapTurns: 0,
@@ -143,6 +152,28 @@ describe("MemoryManager", () => {
     expect(call[2].tags).toContain("convention");
   });
 
+  it("growth gate: repeated signals for an unchanged transcript retain once", async () => {
+    const manager = createManager();
+    await manager.initialize();
+    const turns: Message[] = [
+      { role: "user", content: "what is the test framework?" },
+      { role: "assistant", content: "we use vitest" },
+    ];
+
+    await manager.retainTurns("ses-gate", turns);
+    await manager.retainTurns("ses-gate", turns); // same transcript, refired signal
+
+    expect(mockClient.retain).toHaveBeenCalledTimes(1);
+
+    const grown: Message[] = [
+      ...turns,
+      { role: "user", content: "and the linter?" },
+      { role: "assistant", content: "biome" },
+    ];
+    await manager.retainTurns("ses-gate", grown);
+    expect(mockClient.retain).toHaveBeenCalledTimes(2);
+  });
+
   it("does not retain secrets", async () => {
     const manager = createManager();
     await manager.initialize();
@@ -181,5 +212,90 @@ describe("MemoryManager", () => {
 
     const answer = await manager.reflect("what do we know?");
     expect(answer).toBe("reflected answer");
+  });
+
+  it("bounds outgoing recall and reflect queries to maxRecallQueryTokens", async () => {
+    const manager = createManager();
+    await manager.initialize();
+
+    // CJK costs 3 "tokens" per character under the byte-aware estimator:
+    // 500 tokens => 166 characters survive.
+    const huge = "漢".repeat(2000);
+    await manager.recallByQuery(huge);
+    await manager.reflect(huge);
+
+    for (const call of mockClient.recall.mock.calls) {
+      const query = call[1] as string;
+      expect([...query].length).toBeLessThanOrEqual(167);
+    }
+    const reflectQuery = mockClient.reflect.mock.calls[0][1] as string;
+    expect([...reflectQuery].length).toBeLessThanOrEqual(167);
+  });
+
+  it("drives auto-inject end to end: one reflect, frozen block, budget 'low'", async () => {
+    mockClient.recall.mockResolvedValue({ results: [{ text: "core fact", type: "world" }] });
+    mockClient.reflect.mockResolvedValue({ text: "We settled on pnpm workspaces." });
+
+    const manager = createManager();
+    await manager.initialize();
+
+    const call = (prompt: string) =>
+      manager.injection.onModelCall({
+        sessionId: "ses-e2e",
+        agent: undefined,
+        prompt,
+        messages: [{ role: "user", content: prompt }],
+      });
+
+    const b1 = await call("what build tool do we use?");
+    const b2 = await call("what build tool do we use?"); // same turn
+    const b3 = await call("and how do we run tests?"); // new turn
+
+    // Exactly one auto-reflect (the initialize() core prefetch may recall; the
+    // reflect call must be the single budget-"low" synthesis).
+    expect(mockClient.reflect).toHaveBeenCalledTimes(1);
+    expect(mockClient.reflect.mock.calls[0][2].budget).toBe("low");
+    expect(b1).toContain("We settled on pnpm workspaces.");
+    expect(b1).toContain("core fact");
+    expect(b2).toBe(b1);
+    expect(b3).toBe(b1); // frozen for the session
+  });
+
+  it("auto-inject mode 'none' injects nothing", async () => {
+    const manager = createManager({ autoInject: "none" });
+    await manager.initialize();
+
+    const block = await manager.injection.onModelCall({
+      sessionId: "ses-none",
+      prompt: "any question at all",
+      messages: [{ role: "user", content: "any question at all" }],
+    });
+
+    expect(block).toBeUndefined();
+    expect(mockClient.reflect).not.toHaveBeenCalled();
+  });
+
+  it("falls back to recall when the auto reflect fails", async () => {
+    mockClient.recall.mockImplementation(async (_bankId: string, query: string) => {
+      if (String(query).includes("core memories")) return { results: [] };
+      // Warm probe so turn 1 is eligible (cold banks defer the first attempt).
+      if (String(query).includes("project decisions conventions")) {
+        return { results: [{ text: "some prior decision", type: "world" }] };
+      }
+      return { results: [{ text: "we use vitest, not jest", type: "world" }] };
+    });
+    mockClient.reflect.mockRejectedValue(new Error("timeout after 20000ms"));
+
+    const manager = createManager();
+    await manager.initialize();
+
+    const block = await manager.injection.onModelCall({
+      sessionId: "ses-fb",
+      prompt: "which test runner do we use?",
+      messages: [{ role: "user", content: "which test runner do we use?" }],
+    });
+
+    expect(mockClient.reflect).toHaveBeenCalledTimes(1);
+    expect(block).toContain("we use vitest, not jest");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { HindsightClientWrapper } from "../../src/memory/client.js";
+import { HindsightClientWrapper, TimeoutError } from "../../src/memory/client.js";
 import { DefaultLogger } from "../../src/logger.js";
 
 describe("HindsightClientWrapper", () => {
@@ -62,5 +62,43 @@ describe("HindsightClientWrapper", () => {
     (wrapper as any).client = mockClient;
 
     await expect(wrapper.deleteDocument("test-bank", "doc-1")).rejects.toThrow("deleteDocument failed");
+  });
+
+  it("rejects with TimeoutError when a call exceeds its deadline", async () => {
+    const mockClient = {
+      reflect: vi.fn(() => new Promise(() => {})), // never settles
+    };
+    const wrapper = new HindsightClientWrapper({
+      baseUrl: "http://localhost:8888",
+      apiKey: null,
+      logger,
+    });
+    (wrapper as any).client = mockClient;
+
+    await expect(
+      wrapper.reflect("test-bank", "query", { budget: "low", timeoutMs: 20 })
+    ).rejects.toBeInstanceOf(TimeoutError);
+  });
+
+  it("passes timeoutMs through nowhere (the SDK takes no signal) and still succeeds when fast", async () => {
+    const mockClient = {
+      recall: vi.fn().mockResolvedValue({ results: [{ text: "fact" }] }),
+    };
+    const wrapper = new HindsightClientWrapper({
+      baseUrl: "http://localhost:8888",
+      apiKey: null,
+      logger,
+    });
+    (wrapper as any).client = mockClient;
+
+    const response = await wrapper.recall("test-bank", "query", {
+      budget: "mid",
+      timeoutMs: 1000,
+    });
+    expect(response.results[0].text).toBe("fact");
+    // The deadline is wrapper-owned: the SDK call receives no timeout field.
+    const passedOptions = mockClient.recall.mock.calls[0][2];
+    expect(passedOptions.timeoutMs).toBeUndefined();
+    expect(passedOptions.queryTimestamp).toBeDefined();
   });
 });
