@@ -233,7 +233,7 @@ All explicit tools accept an optional `agent` parameter to target a specific age
 | `recallTags` | `[]` | Tags to filter recall |
 | `recallTagsMatch` | `"any"` | Tag matching mode |
 | `retainContext` | `"opencode"` | Default context for retained memories |
-| `retainEveryNTurns` | `3` | Retain every N user turns |
+| `retainEveryNTurns` | `3` | Retain every N user turns (partial final window is flushed on session close) |
 | `retainOverlapTurns` | `2` | Overlap turns between retention windows |
 | `retainTags` | `[]` | Tags added to retained memories |
 | `retainMetadata` | `{}` | Metadata added to retained memories |

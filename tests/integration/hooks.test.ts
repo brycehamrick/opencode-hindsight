@@ -156,7 +156,12 @@ describe("registerHooks", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 10));
 
-    expect(memory.retainTurns).toHaveBeenCalledWith("sess-1", [{ role: "user", content: "hi" }], "reviewer");
+    expect(memory.retainTurns).toHaveBeenCalledWith(
+      "sess-1",
+      [{ role: "user", content: "hi" }],
+      "reviewer",
+      { finalFlush: false }
+    );
     cleanup();
   });
 });

@@ -98,7 +98,16 @@ export async function registerHooks(ctx: any, memory: MemoryManager): Promise<()
           const messages = event.messages ?? (await getSessionMessages(ctx, sessionId));
           if (messages.length) {
             const agentName = resolveAgentName(event);
-            await memory.retainTurns(sessionId, messages, agentName);
+            // session.closed: flush the partial window the turn gate never
+            // reached, so the session's final turns aren't lost.
+            // session.idle: normal gated retention (a later closed event, or
+            // the next idle with more turns, covers anything left over).
+            await memory.retainTurns(
+              sessionId,
+              normalizeMessagesWithToolCalls(event.messages) ?? messages,
+              agentName,
+              { finalFlush: event.type === "session.closed" }
+            );
           }
         }
       } catch (error) {
@@ -166,6 +175,69 @@ async function getSessionMessages(
     // Fall through to empty.
   }
   return [];
+}
+
+/** Tools whose activity is pure plumbing; excluded from retained traces. */
+const OPERATIONAL_TOOL_PARTS = new Set([
+  "read", "write", "bash", "glob", "grep", "ls", "list", "cat",
+  "sed", "awk", "find", "head", "tail", "process", "spawn",
+]);
+
+/**
+ * Extract compact tool-call traces from raw host message parts.
+ * Handles the tool-part shapes seen across opencode builds:
+ * { type: "tool", tool, state: { input, title/status } } and legacy
+ * { type: "toolCall", tool, input }. Returns undefined when the payload
+ * carries no recognizable tool parts (older hosts), so callers can keep
+ * their existing message normalization.
+ */
+function extractToolTraces(parts: any): { name: string; summary?: string; inputJson?: string }[] | undefined {
+  if (!Array.isArray(parts)) return undefined;
+  const traces: { name: string; summary?: string; inputJson?: string }[] = [];
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "tool" || part.type === "toolCall") {
+      const name = part.tool ?? part.name;
+      if (typeof name !== "string" || !name) continue;
+      if (OPERATIONAL_TOOL_PARTS.has(name)) continue;
+      const state = part.state ?? {};
+      const input = state.input ?? part.input;
+      let inputJson: string | undefined;
+      if (input != null) {
+        try {
+          inputJson = JSON.stringify(input);
+        } catch {
+          inputJson = undefined;
+        }
+      }
+      traces.push({
+        name,
+        summary: typeof state.title === "string" ? state.title : undefined,
+        inputJson,
+      });
+    }
+  }
+  return traces.length ? traces : undefined;
+}
+
+function normalizeMessagesWithToolCalls(raw: any): Message[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const messages = normalizeMessages(raw);
+  // normalizeMessages drops tool parts; re-attach traces by index for the
+  // assistant messages that had them.
+  let attached = 0;
+  for (let i = 0; i < raw.length && i < messages.length; i++) {
+    const source = raw[i];
+    if (!source || typeof source !== "object") continue;
+    const role = source.info?.role ?? source.role;
+    if (role !== "assistant") continue;
+    const traces = extractToolTraces(source.parts ?? source.content);
+    if (traces) {
+      messages[i].toolCalls = traces;
+      attached++;
+    }
+  }
+  return attached ? messages : messages;
 }
 
 function normalizeMessages(raw: any[]): Message[] {

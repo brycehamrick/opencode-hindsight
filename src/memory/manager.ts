@@ -17,6 +17,13 @@ export interface MemoryManager {
   recallByQuery(query: string, maxTokens?: number, agentName?: string): Promise<RecallResult[]>;
   reflect(query: string, context?: string, agentName?: string): Promise<string>;
   retainTurns(sessionId: string, turns: Message[], agentName?: string): Promise<void>;
+  retainTurns(
+    sessionId: string,
+    turns: Message[],
+    agentName?: string,
+    options?: { finalFlush?: boolean }
+  ): Promise<void>;
+  flushFinalTurns(sessionId: string, turns: Message[], agentName?: string): Promise<void>;
   retainFact(fact: string, context?: string, metadata?: Record<string, string>, tags?: string[], agentName?: string): Promise<void>;
   forget(documentId?: string, query?: string, agentName?: string): Promise<boolean>;
   onCompaction(sessionId: string, turns?: Message[], agentName?: string): Promise<string | null>;
@@ -216,16 +223,30 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
   async function retainTurns(
     sessionId: string,
     turns: Message[],
-    agentName?: string
+    agentName?: string,
+    options?: { finalFlush?: boolean }
   ): Promise<void> {
     if (!config.autoRetain || config.retainMode === "none") return;
 
     const engines = getEngines(agentName ?? defaultAgentName);
     state.sessions[sessionId] ??= { lastRetainedTurn: 0 };
     const previousState = state.sessions[sessionId];
-    const nextState = await engines.retention.retainTurns(sessionId, turns, previousState);
+    const nextState = options?.finalFlush
+      ? await engines.retention.flushFinalTurns(sessionId, turns, previousState)
+      : await engines.retention.retainTurns(sessionId, turns, previousState);
     state.sessions[sessionId] = nextState;
     await persistState();
+
+    // Freshly retained memories may qualify as core ("core"-tagged); the
+    // cached core-memory list predates them. Drop the cache so the next
+    // message pulls an updated view instead of serving stale memories.
+    if (engines.coreMemoryPromise) {
+      engines.coreMemoryPromise = null;
+    }
+  }
+
+  async function flushFinalTurns(sessionId: string, turns: Message[], agentName?: string): Promise<void> {
+    await retainTurns(sessionId, turns, agentName, { finalFlush: true });
   }
 
   async function retainFact(
@@ -237,6 +258,10 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
   ): Promise<void> {
     const engines = getEngines(agentName ?? defaultAgentName);
     await engines.retention.retainFact(fact, context, metadata, tags);
+    // Explicit "core"-tagged facts should surface in core memory immediately.
+    if (tags?.includes("core")) {
+      engines.coreMemoryPromise = null;
+    }
   }
 
   async function forget(
@@ -299,6 +324,7 @@ export function createMemoryManager(deps: MemoryManagerDependencies): MemoryMana
     recallByQuery,
     reflect,
     retainTurns,
+    flushFinalTurns,
     retainFact,
     forget,
     onCompaction,

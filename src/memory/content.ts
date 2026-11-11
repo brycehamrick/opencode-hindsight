@@ -39,6 +39,18 @@ export function stripBase64(content: string, maxChunkLength = 64): string {
   });
 }
 
+/** Format a tool-call trace line for retention.
+ *
+ * Compact representation of non-operational tool activity so memory keeps the
+ * *what and how* of a session ("edited servers/work.md", "ran the test suite")
+ * without retaining full tool payloads or noisy operational output. */
+export function formatToolTrace(toolName: string, summary?: string): string {
+  const name = toolName.trim() || "tool";
+  if (!summary || !summary.trim()) return `[tool: ${name}]`;
+  const compact = summary.trim().replace(/\s+/g, " ");
+  return `[tool: ${name} ${compact.slice(0, 120)}]`;
+}
+
 /** Prepare content for retention. */
 export function sanitizeForRetention(
   content: string,

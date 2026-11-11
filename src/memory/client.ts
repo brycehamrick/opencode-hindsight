@@ -14,6 +14,8 @@ export interface RecallOptions {
   types?: string[];
   tags?: string[];
   tagsMatch?: "any" | "all" | "any_strict" | "all_strict";
+  /** Sent automatically as the current time when unset (see recall below). */
+  queryTimestamp?: string;
 }
 
 export interface RetainOptions {
@@ -37,6 +39,13 @@ export interface ReflectResponse {
   text: string | null;
 }
 
+/** Delays for HTTP 429 (rate limit) retries.
+ *
+ * Aligned with typical edge rate-limit block windows (e.g. a Cloudflare
+ * "block 10s" rule in front of a self-hosted Hindsight): retrying sooner
+ * than the block window just burns attempts. */
+const RATE_LIMIT_DELAYS_MS = [10_000, 20_000, 40_000];
+
 async function withRetry<T>(
   operation: () => Promise<T>,
   logger: Logger,
@@ -44,25 +53,49 @@ async function withRetry<T>(
   baseDelayMs = 250
 ): Promise<T> {
   let lastError: unknown;
-  for (let attempt = 0; attempt < retries; attempt++) {
+  let rateLimitAttempt = 0;
+  for (let attempt = 0; attempt < retries + RATE_LIMIT_DELAYS_MS.length; attempt++) {
     try {
       return await operation();
     } catch (error) {
       lastError = error;
-      const isRetryable = isRetryableError(error);
-      if (!isRetryable || attempt === retries - 1) break;
-      const delay = baseDelayMs * 2 ** attempt;
-      logger.debug("Hindsight API call failed, retrying", { attempt: attempt + 1, delay });
+      const rateLimited = errorStatus(error) === 429;
+      if (!rateLimited && !isRetryableError(error)) break;
+
+      let delay: number;
+      if (rateLimited) {
+        if (rateLimitAttempt >= RATE_LIMIT_DELAYS_MS.length) break;
+        delay = RATE_LIMIT_DELAYS_MS[rateLimitAttempt++];
+      } else {
+        if (attempt >= retries - 1) break;
+        delay = baseDelayMs * 2 ** attempt;
+      }
+      logger.debug("Hindsight API call failed, retrying", {
+        attempt: attempt + 1,
+        delay,
+        rateLimited,
+      });
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
   }
   throw lastError;
 }
 
-function isRetryableError(error: unknown): boolean {
+function errorStatus(error: unknown): number | undefined {
   if (error && typeof error === "object") {
     const status = (error as { status?: number }).status;
-    if (status && status >= 500) return true;
+    if (typeof status === "number") return status;
+    // fetch()-style errors expose the Response itself
+    const response = (error as { response?: { status?: number } }).response;
+    if (response && typeof response.status === "number") return response.status;
+  }
+  return undefined;
+}
+
+function isRetryableError(error: unknown): boolean {
+  if (error && typeof error === "object") {
+    const status = errorStatus(error);
+    if (status === 429 || (status !== undefined && status >= 500)) return true;
     const code = (error as { code?: string }).code;
     if (code && ["ECONNRESET", "ETIMEDOUT", "ENOTFOUND", "ECONNREFUSED"].includes(code)) return true;
   }
@@ -108,6 +141,9 @@ export class HindsightClientWrapper {
           types: options.types,
           tags: options.tags,
           tagsMatch: options.tagsMatch,
+          // Temporal retrieval keys off this; a missing timestamp degrades
+          // recency-sensitive queries. Always send "now" unless overridden.
+          queryTimestamp: options.queryTimestamp ?? new Date().toISOString(),
         }),
       this.logger
     );
