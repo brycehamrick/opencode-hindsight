@@ -2,143 +2,56 @@
 
 A best-in-class, token-efficient long-term memory plugin for [OpenCode](https://opencode.ai).
 
-## Features
+## Why this plugin
 
-- **Once-per-session memory injection** — one reflect synthesis per session (default), injected as a byte-stable block so the provider's prefix cache stays valid; per-message recall available as `autoInject: "perMessage"`.
-- **Core memory** — a small, always-injected block of high-stability facts (preferences, conventions), frozen per session.
-- **Per-agent scoping** — different OpenCode agents can have isolated memory banks.
-- **Smart retention** — defaults to retaining atomic facts instead of full transcripts.
-- **Token budgets** — caps injected memory per turn to avoid wasting tokens.
-- **Safety** — strips secrets, API keys, base64 blobs, and large tool outputs before retention.
-- **Durable state** — plugin state survives restarts via `ctx.storage`.
-- **Explicit tools** — `hindsight_retain`, `hindsight_recall`, `hindsight_reflect`, `hindsight_forget`.
-- **Diagnostics** — every recall/reflect/retain outcome logged to `~/.hindsight/diagnostics.log`.
-- **Self-hosted or hosted** — works with your own Hindsight instance or Hindsight Cloud.
+Memory that helps is also context you pay for on every turn. This plugin is
+built around token and memory efficiency — measured, not assumed. The
+benchmark below ships in the repo (`npm run bench`) and runs as a release
+gate:
+
+| 20-turn session (measured) | Per-message recall (the common pattern) | This plugin (default) |
+|---|---|---|
+| Memory API calls | 22 | **3** |
+| Injected memory blocks | 20 | **1** |
+| Cumulative injected characters | 5,195 | **438** |
+| System-prompt changes across the session | every turn | **0 — byte-constant** |
+
+What that buys you, and what sets it apart from other memory integrations:
+
+- **Prefix-cache-safe injection.** Memory is delivered as one stored synthetic
+  user message — once per session, on change only — never as per-turn system
+  prompt additions. A system prompt that changes turn to turn silently
+  re-bills the whole conversation as uncached input on every request; here it
+  stays byte-identical for the session.
+- **Once-per-session reflect.** One synthesis answers "what do we already know
+  about this?"; deeper memory is pulled on demand through tools instead of
+  pushed at every message. A failed synthesis falls back to recall rather than
+  costing the session its memory.
+- **Frozen core memory.** A small block of high-stability facts (preferences,
+  conventions) is fetched once and byte-frozen for the session — always
+  present, never re-billed as cache-invalidating churn.
+- **Budgets on everything.** Caps on injected tokens, a byte-aware ceiling on
+  outgoing queries, and attempt budgets on retries — waste is bounded by
+  construction.
+- **Per-agent memory scoping.** Different OpenCode agents can have isolated
+  memory banks (`reviewer::my-project` vs `debugger::my-project`).
+- **Lean retention.** Defaults to atomic facts instead of full transcripts,
+  with secrets, API keys, base64 blobs, and large tool outputs stripped before
+  anything is stored.
+- **Diagnostics.** Every recall/reflect/inject/retain outcome logged to
+  `~/.hindsight/diagnostics.log` — a memory-less session never looks like a
+  healthy one.
+- **One-line install.** No installer CLI, no extra config files — just the
+  plugin entry in your OpenCode config.
+
+Also: durable state via `ctx.storage`, self-hosted or Hindsight Cloud, and
+explicit `hindsight_retain` / `hindsight_recall` / `hindsight_reflect` /
+`hindsight_forget` tools.
 
 ## Installation
 
-Install the plugin from npm:
-
-```bash
-npm install -g @brycehamrick/opencode-hindsight
-```
-
-> **Renamed:** this package was previously published as `@brycehamrick/opencode-v2-hindsight`. If your config references the old name, update it to `@brycehamrick/opencode-hindsight`.
-
-OpenCode resolves the `"package"` field in `opencode.jsonc` against npm by default, so you can reference the package by name.
-
-### 1. Add to your OpenCode config
-
-OpenCode reads config from the global config location (commonly `~/.config/opencode/opencode.jsonc`) and from project configs such as `.opencode/opencode.jsonc` or `opencode.jsonc` in the project directory. Project configs override global ones. The exact global path can vary by OS/OpenCode version — check `opencode --help` or the OpenCode docs if the file does not exist.
-
-#### Option A: Global config
-
-Edit your global OpenCode config (commonly `~/.config/opencode/opencode.jsonc`):
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "@brycehamrick/opencode-hindsight",
-      "options": {
-        "dynamicBankId": true,
-        "dynamicBankGranularity": ["agent", "gitProject"]
-      }
-    }
-  ]
-}
-```
-
-#### Option B: Per-project config
-
-Create `.opencode/opencode.jsonc` in your project root:
-
-```jsonc
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugins": [
-    {
-      "package": "@brycehamrick/opencode-hindsight",
-      "options": {
-        "bankId": "my-project",
-        "dynamicBankId": true,
-        "dynamicBankGranularity": ["agent", "gitProject"]
-      }
-    }
-  ]
-}
-```
-
-> Plugin options from a project `opencode.jsonc` merge over the global config. Later entries in the `plugins` array override earlier ones.
-
-### 2. Set your Hindsight credentials
-
-You can set the connection options in `opencode.jsonc` **or** via environment variables. The plugin config is usually cleaner.
-
-#### Self-hosted Hindsight
-
-In `opencode.jsonc`:
-
-```jsonc
-{
-  "plugins": [
-    {
-      "package": "@brycehamrick/opencode-hindsight",
-      "options": {
-        "hindsightApiUrl": "http://localhost:8888"
-      }
-    }
-  ]
-}
-```
-
-Or via environment variable:
-
-```bash
-export HINDSIGHT_API_URL="http://localhost:8888"
-```
-
-No API token is required for unauthenticated self-hosted instances, so `hindsightApiToken` can be left unset (it defaults to `null`).
-
-#### Hindsight Cloud (hosted)
-
-In `opencode.jsonc`:
-
-```jsonc
-{
-  "plugins": [
-    {
-      "package": "@brycehamrick/opencode-hindsight",
-      "options": {
-        "hindsightApiUrl": "https://api.hindsight.vectorize.io",
-        "hindsightApiToken": "hz_..."
-      }
-    }
-  ]
-}
-```
-
-Or via environment variables:
-
-```bash
-export HINDSIGHT_API_TOKEN="hz_..."
-# Optional: override the endpoint
-export HINDSIGHT_API_URL="https://api.hindsight.vectorize.io"
-```
-
-### 3. Restart OpenCode
-
-OpenCode loads plugins at startup. Restart it after changing `opencode.jsonc`.
-
-## Global config + per-project overrides
-
-The recommended setup is:
-
-1. **Globally** enable the plugin with base options in `~/.config/opencode/opencode.jsonc`.
-2. **Per project**, create `.opencode/opencode.jsonc` to override only what needs to differ.
-
-Example global config:
+OpenCode resolves the `"package"` field against npm, so there is nothing to
+install — add the plugin to your OpenCode config and you're done:
 
 ```jsonc
 {
@@ -149,14 +62,35 @@ Example global config:
       "options": {
         "dynamicBankId": true,
         "dynamicBankGranularity": ["agent", "gitProject"],
-        "retainMode": "facts"
+        "hindsightApiUrl": "http://localhost:8888"
       }
     }
   ]
 }
 ```
 
-Example per-project override:
+Connection settings, in brief:
+
+- **Self-hosted Hindsight** (shown above): set `hindsightApiUrl` to your
+  server. No token is needed unless the server enforces auth
+  (`hindsightApiToken` defaults to `null`).
+- **Hindsight Cloud**: set `"hindsightApiToken": "hz_..."` and leave
+  `hindsightApiUrl` at its default.
+- Credentials may also come from the environment (`HINDSIGHT_API_URL`,
+  `HINDSIGHT_API_TOKEN`), which take priority over plugin options.
+
+The full option set — injection modes, token budgets, retention behavior — is
+in [Configuration](#configuration). Config file locations and reload behavior
+are documented by [OpenCode](https://opencode.ai/docs/config) itself.
+
+> **Renamed:** this package was previously published as
+> `@brycehamrick/opencode-v2-hindsight`. If your config references the old
+> name, update it to `@brycehamrick/opencode-hindsight`.
+
+## Per-project overrides
+
+A common pattern: enable dynamic per-repo banks globally, then pin one
+project to a static bank ID in its project config:
 
 ```jsonc
 {
@@ -174,9 +108,9 @@ Example per-project override:
 }
 ```
 
-The project config replaces the global plugin options for that workspace. If you want both global and project options merged, list the plugin once in the global config and again in the project config with the overrides.
-
-> The plugin also reads `~/.hindsight/opencode.json` for persistent defaults (see Configuration priority below). This is useful for credentials and settings you don't want to commit to a repo.
+> The plugin also reads `~/.hindsight/opencode.json` for persistent defaults
+> (see Configuration priority below) — useful for credentials and settings you
+> don't want to commit to a repo.
 
 ## Per-agent scoping
 
@@ -378,7 +312,8 @@ Requires OpenCode v2.0 or newer; not compatible with OpenCode V1. Built for
 and tested against opencode v2.0.27. The 0.4.x pipeline (once-per-session
 reflect injection, synthetic-message channel, fallback chain, idle-refetch
 write-back) is verified by 154 tests plus a structural benchmark
-(`npm run bench`) that gates the prefix-cache invariant in CI.
+(`npm run bench`) that gates the prefix-cache invariant on every release
+(`prepublishOnly`).
 
 ## License
 
