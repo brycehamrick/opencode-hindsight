@@ -1,0 +1,34 @@
+{
+  "name": "@brycehamrick/opencode-v2-hindsight",
+  "version": "0.1.4",
+  "description": "RENAMED to @brycehamrick/opencode-hindsight — this stub forwards to the new package. Update your opencode config: \"package\": \"@brycehamrick/opencode-hindsight\"",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "keywords": [
+    "opencode",
+    "hindsight",
+    "memory",
+    "plugin"
+  ],
+  "author": "Bryce Hamrick",
+  "license": "MIT",
+  "dependencies": {
+    "@brycehamrick/opencode-hindsight": "^0.3.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
